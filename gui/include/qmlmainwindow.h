@@ -142,8 +142,8 @@ public:
     double pendingFrameAge() const;
     // Stats overlay: decoded pictures per second that arrived, and that the
     // Direct3D 11 presenter put on screen (-1 where that is not counted).
-    int arrivedFps() const { return stats_arrived_fps.load(); }
-    int shownFps() const { return stats_shown_fps.load(); }
+    Q_INVOKABLE int arrivedFps() const { return stats_arrived_fps.load(); }
+    Q_INVOKABLE int shownFps() const { return stats_shown_fps.load(); }
     QString describePlaceboDiscardReason(qint64 now_us) const;
 
     bool amdCard() const;

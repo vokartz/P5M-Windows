@@ -366,6 +366,8 @@ class StreamSession : public QObject
 		bool learn_stalled = false;
 		std::atomic<bool> learn_stop_requested { false };
 		std::atomic<bool> learn_quit_error { false };
+		// -1 = off; otherwise the next step of the debug bitrate experiment.
+		int bitrate_test_step = -1;
 		void LearnFromSession();
 
 		void StartAudioOutDrainThread();
@@ -429,6 +431,11 @@ class StreamSession : public QObject
 		double GetConsoleTargetMbps() const { return session.stream_connection.quality_target_bitrate / 1000000.0; }
 		double GetRoundTripMs() const { return session.stream_connection.quality_rtt_ms; }
 		double GetAudioTargetMs() const { return audio_target_ms.load(); }
+		// The same four for the stats drawn in the QML scene.
+		Q_INVOKABLE double askedBitrateMbps() const { return GetAskedBitrateMbps(); }
+		Q_INVOKABLE double consoleTargetMbps() const { return GetConsoleTargetMbps(); }
+		Q_INVOKABLE double roundTripMs() const { return GetRoundTripMs(); }
+		Q_INVOKABLE double audioTargetMs() const { return GetAudioTargetMs(); }
 		quint64 DecoderFlushGeneration() const { return decoder_flush_generation.loadRelaxed(); }
 		int GetFramesLost()		{ return frames_lost; }
 		bool GetMuted()	{ return muted; }

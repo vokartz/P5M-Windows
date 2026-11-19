@@ -162,6 +162,22 @@ typedef struct chiaki_takion_t
 	bool video_queue_initialized;
 	int64_t video_queue_head_wait_start_us;
 	uint64_t video_queue_head_wait_seq_num;
+	// How long to wait for a missing AV packet before going on without it.
+	// One frame by default; the stream connection raises it over the internet.
+	int64_t av_reorder_timeout_us;
+	// With a maximum set (0 = fixed wait) the wait adapts: a packet that
+	// arrives after it was given up on shows how much longer the wait had to
+	// be, and the wait grows to that; quiet stretches shrink it again.
+	int64_t av_reorder_timeout_min_us;
+	int64_t av_reorder_timeout_max_us;
+	// The last gap given up on: when, after waiting how long, which packets.
+	int64_t av_reorder_skip_time_us;
+	int64_t av_reorder_skip_waited_us;
+	uint64_t av_reorder_skip_begin;
+	uint64_t av_reorder_skip_count;
+	// Diary of the current 10 s window.
+	unsigned int av_reorder_raises;
+	unsigned int av_reorder_late_after_skip;
 	// Contagem de unidades AV já entregues no quadro atual para avaliar o FEC.
 	bool p5m_fec_frame_valid;
 	ChiakiSeqNum16 p5m_fec_frame_index;

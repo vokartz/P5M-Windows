@@ -19,6 +19,11 @@ Item {
     readonly property bool useSeparateMenuWindow: Chiaki.window.runtimeRendererBackend === 1
     readonly property int streamMenuHeight: 200
     readonly property bool streamStatsVisible: Chiaki.settings.showStreamStats && Chiaki.session && !(menuController.open || menuController.closing) && !sessionLoading && !sessionError && !(Chiaki.settings.audioVideoDisabled & 0x02)
+    // Direct3D 11 / Metal presenter: the stats are drawn in this scene. The
+    // separate overlay window made Windows compose the picture instead of
+    // flipping it straight to the screen: one refresh later, and about 50
+    // pictures a second instead of 60.
+    readonly property bool statsInScene: Chiaki.window.runtimeRendererBackend === 2
     property int separateMenuX: 0
     property int separateMenuY: 0
     property int separateMenuWidth: 0
@@ -90,11 +95,11 @@ Item {
     Component.onCompleted: {
         updateSeparateMenuGeometry();
         updateOverlayInteractionActive();
-        Chiaki.window.setStatsOverlayActive(streamStatsVisible);
+        Chiaki.window.setStatsOverlayActive(streamStatsVisible && !statsInScene);
     }
     onStreamStatsVisibleChanged: {
         if (Chiaki.window)
-            Chiaki.window.setStatsOverlayActive(streamStatsVisible);
+            Chiaki.window.setStatsOverlayActive(streamStatsVisible && !statsInScene);
     }
     onWidthChanged: updateSeparateMenuGeometry()
     onHeightChanged: updateSeparateMenuGeometry()
@@ -435,6 +440,90 @@ Item {
                         }
                         text: parent.visible ? ((Chiaki.session && isFinite(Chiaki.session.framesLost)) ? Chiaki.session.framesLost : 0) : ""
                         color: "#ef9a9a"
+                        font.bold: true
+                        font.pixelSize: 18
+                    }
+                }
+            }
+        }
+    }
+
+    // The stats drawn in the scene (statsInScene): same numbers as the
+    // overlay window, refreshed once a second.
+    Rectangle {
+        id: sceneStats
+        visible: view.streamStatsVisible && view.statsInScene
+        anchors {
+            right: parent.right
+            verticalCenter: parent.verticalCenter
+            rightMargin: 6
+        }
+        width: sceneStatsColumn.implicitWidth + 28
+        height: sceneStatsColumn.implicitHeight + 24
+        radius: 10
+        color: Qt.rgba(0, 0, 0, 0.55)
+        property var rows: []
+
+        function refresh() {
+            const s = Chiaki.session;
+            const w = Chiaki.window;
+            if (!s) {
+                rows = [];
+                return;
+            }
+            const blue = "#00a7ff", green = "#a5d6a7", pale = "#90caf9", red = "#ef9a9a";
+            let r = [];
+            r.push({ label: "Mbps", value: s.measuredBitrate.toFixed(1), tint: blue });
+            const asked = s.askedBitrateMbps();
+            if (asked > 0)
+                r.push({ label: qsTr("asked Mbps"), value: asked.toFixed(1), tint: blue });
+            const target = s.consoleTargetMbps();
+            if (target > 0)
+                r.push({ label: qsTr("console Mbps"), value: target.toFixed(1), tint: blue });
+            const roundTrip = s.roundTripMs();
+            if (roundTrip > 0)
+                r.push({ label: qsTr("round trip"), value: qsTr("%1 ms").arg(roundTrip.toFixed(0)), tint: green });
+            const fpsIn = w.arrivedFps();
+            const fpsShown = w.shownFps();
+            if (fpsIn > 0)
+                r.push({ label: qsTr("fps in / shown"), value: fpsShown >= 0 ? fpsIn + " / " + fpsShown : "" + fpsIn, tint: green });
+            r.push({ label: qsTr("sound buffer"), value: qsTr("%1 ms").arg(s.audioTargetMs().toFixed(0)), tint: pale });
+            const loss = isFinite(s.averagePacketLoss) ? s.averagePacketLoss * 100 : 0;
+            r.push({ label: qsTr("packet loss"), value: loss.toFixed(1) + "%", tint: red });
+            if (w.droppedFrames > 0)
+                r.push({ label: qsTr("dropped frames"), value: "" + w.droppedFrames, tint: red });
+            r.push({ label: qsTr("lost frames"), value: "" + s.framesLost, tint: red });
+            rows = r;
+        }
+
+        Timer {
+            interval: 1000
+            repeat: true
+            triggeredOnStart: true
+            running: sceneStats.visible
+            onTriggered: sceneStats.refresh()
+        }
+
+        Column {
+            id: sceneStatsColumn
+            anchors.centerIn: parent
+            spacing: 6
+            Repeater {
+                model: sceneStats.rows
+                Row {
+                    spacing: 8
+                    Label {
+                        width: 120
+                        horizontalAlignment: Text.AlignRight
+                        text: modelData.label
+                        color: "white"
+                        font.pixelSize: 15
+                    }
+                    Label {
+                        width: 90
+                        horizontalAlignment: Text.AlignRight
+                        text: modelData.value
+                        color: modelData.tint
                         font.bold: true
                         font.pixelSize: 18
                     }

@@ -65,6 +65,10 @@
 static constexpr unsigned LEARN_MAX_KBPS = 100000;
 // No packets for this long while connected = the stream froze.
 static constexpr int LEARN_STALL_MS = 4000;
+// Version of the learning rules. A network learned under older rules starts
+// again (2: late packets are waited for; lost frames are tested, see
+// LearnFromSession).
+static constexpr int LEARN_RULES = 2;
 
 #if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
 class SdeckHapticsWorker : public QObject
@@ -518,6 +522,20 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 		{
 			learn_key = QStringLiteral("learn/%1-%2").arg(local ? QStringLiteral("local") : QStringLiteral("remote"), net.replace(QLatin1Char(':'), QLatin1Char('-')));
 			QSettings learn;
+			if(learn.value(learn_key + QStringLiteral("/rules"), 1).toInt() < LEARN_RULES)
+			{
+				// What was learned under the old rules counted late packets
+				// as lost frames and stepped the bitrate down for them: start
+				// this network again from the bitrate in the settings.
+				for(const char *stale : { "/bad_kbps", "/bitrate_kbps", "/clean_at_top", "/probe_kbps", "/probe_lpm", "/noise_lpm" })
+					learn.remove(learn_key + QLatin1String(stale));
+				learn.setValue(learn_key + QStringLiteral("/rules"), LEARN_RULES);
+			}
+			if(learn.value(QStringLiteral("settings/bitrate_experiment"), false).toBool())
+			{
+				bitrate_test_step = 0;
+				CHIAKI_LOGI(log.GetChiakiLog(), "[bitrate-test] on: the debug bitrate message goes out at 30, 60 and 90 s");
+			}
 			learn_cap_kbps = learn.value(learn_key + QStringLiteral("/bad_kbps"), 0).toUInt();
 			const unsigned learned = learn.value(learn_key + QStringLiteral("/bitrate_kbps"), 0).toUInt();
 			// P5M range: away from home the learned bitrate stays between the
@@ -764,6 +782,23 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 			CHIAKI_LOGI(log.GetChiakiLog(), "[learn] the stream froze for %d ms at %u kbps: the next session will ask for less",
 				LEARN_STALL_MS, learn_used_kbps);
 		}
+		// Experiment (settings/bitrate_experiment, off unless set by hand):
+		// send the protocol's unused debug bitrate message at 30, 60 and
+		// 90 s and let the "P5M: bitrate 10s" lines show what the console
+		// made of it.
+		if(bitrate_test_step >= 0 && bitrate_test_step < 3 && connected && learn_timer.isValid())
+		{
+			static const struct { int at_s; bool toggle; bool change; float value; } steps[3] = {
+				{ 30, false, true, 1.25f },
+				{ 60, true, false, 0.0f },
+				{ 90, false, true, 1.25f },
+			};
+			if(learn_timer.elapsed() >= steps[bitrate_test_step].at_s * 1000)
+			{
+				const auto &step = steps[bitrate_test_step++];
+				stream_connection_send_debug_bitrate(&session.stream_connection, step.toggle, step.change, step.value);
+			}
+		}
 		if(packet_loss_history.size() > 10)
 			packet_loss_history.takeFirst();
 		packet_loss_history.append(session.stream_connection.congestion_control.packet_loss);
@@ -816,17 +851,75 @@ void StreamSession::LearnFromSession()
 	int clean_at_top = learn.value(learn_key + QStringLiteral("/clean_at_top"), 0).toInt();
 	unsigned next = learn_used_kbps;
 	const char *what = "kept";
-	if(stalled || (!judged && dropped) || (judged && (loss > 0.01 || lost_per_min > 3)))
+	// Lost frames are an unreliable witness: a line with short stalls loses
+	// some at any bitrate, and stepping down for them only blurs the picture
+	// (one evening went 12 -> 10 -> 8 -> 6 Mbps that way). So they are
+	// tested. The first time they show, the bitrate steps back once and the
+	// step is remembered (probe); the next session tells whether it helped.
+	// If it did not, the loss is the line's own (noise): the bitrate goes
+	// back up and that much loss no longer counts against any bitrate.
+	// A freeze, an early drop or real packet loss still count at once.
+	double noise = learn.value(learn_key + QStringLiteral("/noise_lpm"), 0.0).toDouble();
+	unsigned probe_kbps = learn.value(learn_key + QStringLiteral("/probe_kbps"), 0).toUInt();
+	const double probe_lpm = learn.value(learn_key + QStringLiteral("/probe_lpm"), 0.0).toDouble();
+	double next_probe_lpm = 0.0;
+	const bool hard = stalled || (!judged && dropped);
+	const bool packet_loss = judged && loss > 0.01;
+	bool decided = false;
+	if(probe_kbps && (hard || packet_loss || probe_kbps <= learn_used_kbps))
+		probe_kbps = 0; // not a fair test of the step back
+	if(probe_kbps && judged)
+	{
+		if(lost_per_min >= 0.5 * probe_lpm)
+		{
+			// Lower bitrate, about as many lost frames: it is the line.
+			noise = std::max(noise, std::min(lost_per_min, probe_lpm));
+			if(bad && bad <= probe_kbps)
+				bad = 0;
+			next = std::min(probe_kbps, learn_ceiling_kbps);
+			clean_at_top = 0;
+			what = "raised back (a lower bitrate lost as many frames)";
+			decided = true;
+		}
+		else
+		{
+			// It helped: that bitrate was too much for this network.
+			bad = bad ? std::min(bad, probe_kbps) : probe_kbps;
+		}
+		probe_kbps = 0;
+	}
+	// Frames lost per minute this line may lose before a bitrate is blamed,
+	// and how few it must lose for the bitrate to climb.
+	const double blame_lpm = 3.0 + 1.5 * noise;
+	const double calm_lpm = 0.5 + noise;
+	if(decided)
+	{
+		// The test above already chose the next bitrate.
+	}
+	else if(hard || packet_loss)
 	{
 		bad = bad ? std::min(bad, learn_used_kbps) : learn_used_kbps;
 		// A freeze or an early drop is a harder verdict than a few lost
 		// packets: step back further. Never below the floor of the range.
-		const bool hard = stalled || !judged;
 		next = std::max(std::min(learn_floor_kbps, learn_used_kbps), unsigned(learn_used_kbps * (hard ? 0.75 : 0.85)));
 		clean_at_top = 0;
-		what = stalled ? "lowered (the stream froze)" : (!judged ? "lowered (dropped early)" : "lowered");
+		what = stalled ? "lowered (the stream froze)" : (!judged ? "lowered (dropped early)" : "lowered (packet loss)");
 	}
-	else if(!dropped && loss < 0.002 && lost_per_min < 0.5)
+	else if(judged && lost_per_min > blame_lpm)
+	{
+		next = std::max(std::min(learn_floor_kbps, learn_used_kbps), unsigned(learn_used_kbps * 0.85));
+		next = next / 1000 * 1000;
+		clean_at_top = 0;
+		if(next < learn_used_kbps)
+		{
+			probe_kbps = learn_used_kbps;
+			next_probe_lpm = lost_per_min;
+			what = "lowered as a test (lost frames; the next session tells whether it helps)";
+		}
+		else
+			what = "kept (lost frames, but already at the floor)";
+	}
+	else if(!dropped && loss < 0.002 && lost_per_min <= calm_lpm)
 	{
 		// (A session the console dropped is never a reason to climb.)
 		unsigned up = std::min(learn_ceiling_kbps, unsigned(learn_used_kbps * 1.2));
@@ -835,9 +928,9 @@ void StreamSession::LearnFromSession()
 			up = std::min(up, learn_used_kbps + (bad > learn_used_kbps ? (bad - learn_used_kbps) / 2 : 0));
 			if(up < learn_used_kbps + 2000)
 			{
-				// Right under the known limit. Networks change: after five
+				// Right under the known limit. Networks change: after two
 				// clean sessions here, try above it again.
-				if(++clean_at_top >= 5)
+				if(++clean_at_top >= 2)
 				{
 					bad = 0;
 					clean_at_top = 0;
@@ -853,13 +946,21 @@ void StreamSession::LearnFromSession()
 			what = "raised";
 		}
 	}
+	// The line's own loss is a memory, not a licence: when a judged session
+	// loses fewer frames than remembered, the memory follows it down.
+	if(judged && !hard && !packet_loss && lost_per_min < noise)
+		noise = 0.7 * noise + 0.3 * lost_per_min;
 	next = next / 1000 * 1000;
 	learn.setValue(learn_key + QStringLiteral("/bitrate_kbps"), next);
 	learn.setValue(learn_key + QStringLiteral("/bad_kbps"), bad);
 	learn.setValue(learn_key + QStringLiteral("/clean_at_top"), clean_at_top);
+	learn.setValue(learn_key + QStringLiteral("/probe_kbps"), probe_kbps);
+	learn.setValue(learn_key + QStringLiteral("/probe_lpm"), next_probe_lpm);
+	learn.setValue(learn_key + QStringLiteral("/noise_lpm"), noise);
+	learn.setValue(learn_key + QStringLiteral("/rules"), LEARN_RULES);
 	learn.setValue(learn_key + QStringLiteral("/sessions"), learn.value(learn_key + QStringLiteral("/sessions"), 0).toInt() + 1);
-	CHIAKI_LOGI(log.GetChiakiLog(), "[learn] %.1f min, packet loss %.2f%%, %.1f frames lost/min: next bitrate %s %u -> %u kbps (lost packets at %u, 0 = not yet), sound queue %.1f ms",
-		minutes, loss * 100.0, lost_per_min, what, learn_used_kbps, next, bad, audio_target_ms.load());
+	CHIAKI_LOGI(log.GetChiakiLog(), "[learn] %.1f min, packet loss %.2f%%, %.1f frames lost/min (this line's own: %.1f): next bitrate %s %u -> %u kbps (lost packets at %u, 0 = not yet), sound queue %.1f ms",
+		minutes, loss * 100.0, lost_per_min, noise, what, learn_used_kbps, next, bad, audio_target_ms.load());
 }
 
 StreamSession::~StreamSession()

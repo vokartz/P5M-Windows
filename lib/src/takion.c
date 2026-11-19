@@ -44,7 +44,7 @@
 #define TAKION_INBOUND_STREAMS 0x64
 
 #define TAKION_REORDER_QUEUE_SIZE_EXP 4 // => 16 entries
-#define TAKION_AV_VIDEO_REORDER_QUEUE_SIZE_EXP 6 // => 64 entries
+#define TAKION_AV_VIDEO_REORDER_QUEUE_SIZE_EXP 7 // => 128 entries (room for the longer wait over the internet)
 #define TAKION_AV_REORDER_TIMEOUT_US 16000 // ~1 frame at 60fps
 #define TAKION_SEND_BUFFER_SIZE 16
 
@@ -296,6 +296,15 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
 	takion->postponed_packets_size = 0;
 	takion->postponed_packets_count = 0;
 	takion->enable_dualsense = info->enable_dualsense;
+	takion->av_reorder_timeout_us = TAKION_AV_REORDER_TIMEOUT_US;
+	takion->av_reorder_timeout_min_us = 0;
+	takion->av_reorder_timeout_max_us = 0;
+	takion->av_reorder_skip_time_us = 0;
+	takion->av_reorder_skip_waited_us = 0;
+	takion->av_reorder_skip_begin = 0;
+	takion->av_reorder_skip_count = 0;
+	takion->av_reorder_raises = 0;
+	takion->av_reorder_late_after_skip = 0;
 
 	CHIAKI_LOGI(takion->log, "Takion connecting (version %u)", (unsigned int)info->protocol_version);
 	bool mac_dontfrag = true;
@@ -1288,9 +1297,32 @@ static void takion_data_drop(uint64_t seq_num, void *elem_user, void *cb_user)
 	free(entry);
 }
 
+/**
+ * A packet arrived that the AV queue no longer takes. If it belongs to the gap
+ * that was last given up on, it was late, not lost: it tells how long the wait
+ * should have been. Grow the wait to that (adaptive wait only, and only up to
+ * the maximum: beyond it the packet counts as lost).
+ */
+static void takion_av_reorder_learn_from_late(ChiakiTakion *takion, uint64_t seq_num)
+{
+	if(!takion->av_reorder_timeout_max_us || !takion->av_reorder_skip_count)
+		return;
+	if((uint16_t)(seq_num - takion->av_reorder_skip_begin) >= takion->av_reorder_skip_count)
+		return;
+	takion->av_reorder_late_after_skip++;
+	const int64_t late_us = chiaki_time_now_monotonic_us() - takion->av_reorder_skip_time_us;
+	const int64_t needed_us = takion->av_reorder_skip_waited_us + late_us + 5000;
+	if(needed_us > takion->av_reorder_timeout_us && needed_us <= takion->av_reorder_timeout_max_us)
+	{
+		takion->av_reorder_timeout_us = needed_us;
+		takion->av_reorder_raises++;
+	}
+}
+
 static void takion_av_drop(uint64_t seq_num, void *elem_user, void *cb_user)
 {
 	ChiakiTakion *takion = cb_user;
+	takion_av_reorder_learn_from_late(takion, seq_num);
 	CHIAKI_LOGD(takion->log, "Takion dropping AV packet with index %#llx", (unsigned long long)seq_num);
 	TakionAVPacketEntry *entry = elem_user;
 	free(entry->buf);
@@ -1380,6 +1412,23 @@ static void p5m_reorder_log(ChiakiTakion *takion, int64_t now)
 				"gave up on a lost one %u times (%.1f ms held in total), went on at once (FEC fills it) %u times",
 				p5m_reorder.late, p5m_reorder.late ? p5m_reorder.late_sum_us / 1000.0 / p5m_reorder.late : 0.0,
 				p5m_reorder.late_max_us / 1000.0, p5m_reorder.skips, p5m_reorder.skip_sum_us / 1000.0, p5m_reorder.fec_skips);
+	if(takion->av_reorder_timeout_max_us)
+	{
+		// Adaptive wait: a window that needed no longer wait gives a little
+		// back (2%), down to the minimum. A long wait only costs when a
+		// packet is really lost, so it shrinks slowly.
+		if(!takion->av_reorder_raises && takion->av_reorder_timeout_us > takion->av_reorder_timeout_min_us)
+		{
+			takion->av_reorder_timeout_us -= takion->av_reorder_timeout_us / 50;
+			if(takion->av_reorder_timeout_us < takion->av_reorder_timeout_min_us)
+				takion->av_reorder_timeout_us = takion->av_reorder_timeout_min_us;
+		}
+		if(p5m_reorder.skips || takion->av_reorder_late_after_skip || takion->av_reorder_raises)
+			CHIAKI_LOGI(takion->log, "[reorder-wait] 10s: %u packets came after being given up on, wait raised %u times, now %.1f ms",
+					takion->av_reorder_late_after_skip, takion->av_reorder_raises, takion->av_reorder_timeout_us / 1000.0);
+		takion->av_reorder_raises = 0;
+		takion->av_reorder_late_after_skip = 0;
+	}
 	memset(&p5m_reorder, 0, sizeof(p5m_reorder));
 	p5m_reorder.window_start_us = now;
 }
@@ -1464,7 +1513,7 @@ static void takion_av_queue_flush_with_timeout(ChiakiTakion *takion, ChiakiReord
 			if(!fec_covers)
 				break;
 		}
-		if(!fec_covers && now - *head_wait_start_us <= TAKION_AV_REORDER_TIMEOUT_US)
+		if(!fec_covers && now - *head_wait_start_us <= takion->av_reorder_timeout_us)
 			break;
 
 		if(fec_covers)
@@ -1491,6 +1540,14 @@ static void takion_av_queue_flush_with_timeout(ChiakiTakion *takion, ChiakiReord
 		CHIAKI_LOGD(takion->log, "Takion AV reorder timeout: skipping %llu missing packet(s) before %#llx",
 			(unsigned long long)skipped,
 			(unsigned long long)queue->seq_num_add(queue->begin, skipped));
+		if(!fec_covers)
+		{
+			// Remember the gap: a packet of it that still arrives was late.
+			takion->av_reorder_skip_time_us = now;
+			takion->av_reorder_skip_waited_us = now - *head_wait_start_us;
+			takion->av_reorder_skip_begin = queue->begin;
+			takion->av_reorder_skip_count = skipped;
+		}
 		queue->begin = queue->seq_num_add(queue->begin, skipped);
 		queue->count -= skipped;
 		*head_wait_start_us = 0;
@@ -1521,7 +1578,7 @@ static uint64_t takion_av_queues_next_timeout_ms(ChiakiTakion *takion)
 		if(head_wait_start_us == 0)
 			continue;
 
-		int64_t remaining_us = TAKION_AV_REORDER_TIMEOUT_US - (now - head_wait_start_us);
+		int64_t remaining_us = takion->av_reorder_timeout_us - (now - head_wait_start_us);
 		if(remaining_us <= 0)
 			return 0;
 

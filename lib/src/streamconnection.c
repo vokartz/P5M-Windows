@@ -91,6 +91,10 @@ static void p5m_bitrate_janela(ChiakiStreamConnection *sc, int32_t alvo, double 
 
 
 #define STREAM_CONNECTION_PORT 9296
+// How long a remote (PSN) session waits for a missing AV packet.
+#define STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_US 60000
+#define STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_MIN_US 30000
+#define STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_MAX_US 120000
 
 #define EXPECT_TIMEOUT_MS 5000
 // P5M: the console answers the Takion version request in ~2 ms; without an answer, go on with 12 quickly.
@@ -526,6 +530,24 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 		CHIAKI_LOGE(session->log, "StreamConnection connect failed");
 		chiaki_mutex_unlock(&stream_connection->state_mutex);
 		goto err_video_receiver;
+	}
+
+	// Over the internet (a PSN connection brings its own socket) most packets
+	// that look lost are only late. Measured on a 14 minute session: of 393
+	// packets given up on after 16 ms, 280 arrived later, 196 of them within
+	// 60 ms of being given up on. Every one given up on costs a corrupt frame
+	// and the frames that refer to it, so wait longer there.
+	// The wait then follows the line: it grows when a packet arrives after it
+	// was given up on, and shrinks again while none does.
+	if(socket)
+	{
+		stream_connection->takion.av_reorder_timeout_us = STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_US;
+		stream_connection->takion.av_reorder_timeout_min_us = STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_MIN_US;
+		stream_connection->takion.av_reorder_timeout_max_us = STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_MAX_US;
+		CHIAKI_LOGI(session->log, "[reorder-wait] remote session: waiting %d ms for a late packet, adapting between %d and %d ms",
+				STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_US / 1000,
+				STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_MIN_US / 1000,
+				STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_MAX_US / 1000);
 	}
 
 	err = chiaki_congestion_control_start(&stream_connection->congestion_control, &stream_connection->takion, &stream_connection->packet_stats, stream_connection->packet_loss_max);
@@ -1716,6 +1738,40 @@ CHIAKI_EXPORT ChiakiErrorCode stream_connection_send_corrupt_frame(ChiakiStreamC
 	}
 
 	CHIAKI_LOGW(stream_connection->log, "StreamConnection reporting corrupt frame(s) from %u to %u", (unsigned int)start, (unsigned int)end);
+	return chiaki_takion_send_message_data(&stream_connection->takion, 1, 2, buf, stream.bytes_written, NULL);
+}
+
+/**
+ * Experiment: the protocol defines a debug message that changes the bitrate
+ * (DebugOption BITRATE: a toggle and a float "bitrate_change"). Nothing sends
+ * it today and what the console does with it is unknown. This only sends it;
+ * the "P5M: bitrate 10s" lines show whether the console's target moved.
+ */
+CHIAKI_EXPORT ChiakiErrorCode stream_connection_send_debug_bitrate(ChiakiStreamConnection *stream_connection, bool send_toggle, bool send_change, float change)
+{
+	tkproto_TakionMessage msg = { 0 };
+	msg.type = tkproto_TakionMessage_PayloadType_DEBUG;
+	msg.has_debug_payload = true;
+	msg.debug_payload.type = tkproto_DebugOption_Type_BITRATE;
+	msg.debug_payload.has_bitrate = true;
+	msg.debug_payload.bitrate.has_toggle = send_toggle;
+	msg.debug_payload.bitrate.toggle = send_toggle;
+	msg.debug_payload.bitrate.has_bitrate_change = send_change;
+	msg.debug_payload.bitrate.bitrate_change = change;
+
+	uint8_t buf[0x40];
+
+	pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+	bool pbr = pb_encode(&stream, tkproto_TakionMessage_fields, &msg);
+	if(!pbr)
+	{
+		CHIAKI_LOGE(stream_connection->log, "StreamConnection debug bitrate protobuf encoding failed");
+		return CHIAKI_ERR_UNKNOWN;
+	}
+
+	CHIAKI_LOGI(stream_connection->log, "[bitrate-test] sent the debug bitrate message (toggle %s, change %s %.2f); console target was %d",
+			send_toggle ? "yes" : "no", send_change ? "yes" : "no", send_change ? change : 0.0f,
+			(int)stream_connection->quality_target_bitrate);
 	return chiaki_takion_send_message_data(&stream_connection->takion, 1, 2, buf, stream.bytes_written, NULL);
 }
 
