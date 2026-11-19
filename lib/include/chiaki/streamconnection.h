@@ -89,6 +89,10 @@ typedef struct chiaki_stream_connection_t
 	char *remote_disconnect_reason;
 
 	double measured_bitrate;
+	// The console's latest connection quality report (stats overlay):
+	// the bitrate its encoder aims for, in bit/s, and the round trip in ms.
+	int32_t quality_target_bitrate;
+	double quality_rtt_ms;
 } ChiakiStreamConnection;
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnection *stream_connection, ChiakiSession *session, double packet_loss_max);

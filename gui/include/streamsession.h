@@ -422,6 +422,13 @@ class StreamSession : public QObject
 		bool GetConnected() { return connected; }
 		double GetMeasuredBitrate()	{ return measured_bitrate; }
 		double GetAveragePacketLoss()	{ return average_packet_loss; }
+		// Stats overlay: the bitrate this session asked for, the one the
+		// console's encoder aims for, the round trip the console reports and
+		// the sound queue target.
+		double GetAskedBitrateMbps() const { return session.connect_info.video_profile.bitrate / 1000.0; }
+		double GetConsoleTargetMbps() const { return session.stream_connection.quality_target_bitrate / 1000000.0; }
+		double GetRoundTripMs() const { return session.stream_connection.quality_rtt_ms; }
+		double GetAudioTargetMs() const { return audio_target_ms.load(); }
 		quint64 DecoderFlushGeneration() const { return decoder_flush_generation.loadRelaxed(); }
 		int GetFramesLost()		{ return frames_lost; }
 		bool GetMuted()	{ return muted; }

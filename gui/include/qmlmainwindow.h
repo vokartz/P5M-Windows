@@ -140,6 +140,10 @@ public:
 
     double queueDepthAverage() const;
     double pendingFrameAge() const;
+    // Stats overlay: decoded pictures per second that arrived, and that the
+    // Direct3D 11 presenter put on screen (-1 where that is not counted).
+    int arrivedFps() const { return stats_arrived_fps.load(); }
+    int shownFps() const { return stats_shown_fps.load(); }
     QString describePlaceboDiscardReason(qint64 now_us) const;
 
     bool amdCard() const;
@@ -346,6 +350,14 @@ private:
     StreamSession *session = {};
     AVBufferRef *vulkan_hw_dev_ctx = nullptr;
     std::atomic<double> queue_depth_average{0.0};
+    std::atomic<int> stats_arrived_fps{0};
+    std::atomic<int> stats_shown_fps{-1};
+    // Counted on the thread that delivers decoded pictures.
+    int stats_arrived_count = 0;
+    qint64 stats_arrived_since_us = 0;
+    // Counted on the render thread.
+    int stats_shown_count = 0;
+    qint64 stats_shown_since_us = 0;
     QAtomicInteger<int> queue_depth_cached = 0;
     double pending_frame_age = 0.0;
     uint64_t last_placebo_reset_ts = 0;
@@ -449,6 +461,22 @@ private:
     // A decoded frame posted straight to the render thread is waiting to be drawn.
     QAtomicInteger<int> metal_frame_render_queued = 0;
     QAtomicInteger<int> metal_present_deferred = 0;
+#endif
+#if defined(Q_OS_WIN)
+    // Direct3D 11 presenter: decoded pictures waiting for a free present
+    // slot, oldest first (guarded by direct_frame_mutex). Over the internet
+    // pictures arrive in pairs and gaps; with a single "newest wins" slot the
+    // first of each pair was never shown.
+    std::deque<AVFrame *> native_frame_queue;
+    // Presents in a row that left pictures waiting (render thread only).
+    int native_backlog_presents = 0;
+    // Diary, reset every 10 s (guarded by direct_frame_mutex).
+    unsigned native_queue_shown = 0;
+    unsigned native_queue_overflowed = 0;
+    unsigned native_queue_caught_up = 0;
+    unsigned native_queue_waited = 0;
+    unsigned native_queue_depth_max = 0;
+    qint64 native_queue_log_us = 0;
 #endif
     // macOS only; stay false/0 elsewhere (isFullscreen/hiddenTop read them).
     bool mac_fullscreen = false; // borderless fullscreen (setMacBorderlessFullscreen)

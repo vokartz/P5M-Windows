@@ -395,14 +395,10 @@ QmlBackend::QmlBackend(Settings *settings, QmlMainWindow *window)
     installWindowsCrashReport(GetLogBaseDir(), QCoreApplication::applicationVersion());
 #endif
 
-#ifdef Q_OS_WIN
-    {
-        auto *updater = new WindowsUpdater(settings, this);
-        connect(updater, &WindowsUpdater::restartRequested, this, []() { QGuiApplication::quit(); });
-        updater->start();
-        updater_obj = updater;
-    }
-#endif
+    // This fork never looks for updates: the updater downloads the releases
+    // of the original P5M, which would replace this build. Without the
+    // object the Update button and the "Check for updates" setting stay
+    // hidden (the QML treats a null updater as "no updater").
 
     const char *uri = "org.streetpea.chiaking";
     qmlRegisterSingletonInstance(uri, 1, 0, "Chiaki", this);

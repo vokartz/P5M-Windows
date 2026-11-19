@@ -172,7 +172,12 @@ public:
         valueFont.setBold(true);
 
         bitrateRow = makeRow(tr("Mbps"), QColor(QStringLiteral("#00a7ff")), titleFont, valueFont, bitrateValue);
-        queueRow = makeRow(tr("queue depth avg"), QColor(QStringLiteral("#90caf9")), titleFont, valueFont, queueDepthValue);
+        askedRow = makeRow(tr("asked Mbps"), QColor(QStringLiteral("#00a7ff")), titleFont, valueFont, askedValue);
+        targetRow = makeRow(tr("console Mbps"), QColor(QStringLiteral("#00a7ff")), titleFont, valueFont, targetValue);
+        roundTripRow = makeRow(tr("round trip"), QColor(QStringLiteral("#a5d6a7")), titleFont, valueFont, roundTripValue);
+        fpsRow = makeRow(tr("fps in / shown"), QColor(QStringLiteral("#a5d6a7")), titleFont, valueFont, fpsValue);
+        audioRow = makeRow(tr("sound buffer"), QColor(QStringLiteral("#90caf9")), titleFont, valueFont, audioValue);
+        queueRow =makeRow(tr("queue depth avg"), QColor(QStringLiteral("#90caf9")), titleFont, valueFont, queueDepthValue);
         pendingRow = makeRow(tr("pending frame age"), QColor(QStringLiteral("#90caf9")), titleFont, valueFont, pendingAgeValue);
         packetLossRow = makeRow(tr("packet loss"), QColor(QStringLiteral("#ef9a9a")), titleFont, valueFont, packetLossValue);
         droppedFramesRow = makeRow(tr("dropped frames"), QColor(QStringLiteral("#ef9a9a")), titleFont, valueFont, droppedFramesValue);
@@ -254,6 +259,29 @@ public:
         else
             bitrateValue->clear();
 
+        // What was asked for, what the console's encoder aims for, and the
+        // round trip the console measures (both from its quality reports,
+        // so empty until the first one arrives).
+        const double asked = hasSession ? session->GetAskedBitrateMbps() : 0.0;
+        const double target = hasSession ? session->GetConsoleTargetMbps() : 0.0;
+        const double round_trip = hasSession ? session->GetRoundTripMs() : 0.0;
+        askedRow->setVisible(asked > 0.0);
+        askedValue->setText(QString::number(asked, 'f', 1));
+        targetRow->setVisible(target > 0.0);
+        targetValue->setText(QString::number(target, 'f', 1));
+        roundTripRow->setVisible(round_trip > 0.0);
+        roundTripValue->setText(tr("%1 ms").arg(round_trip, 0, 'f', 0));
+
+        // Pictures per second: decoded, and (Direct3D 11) put on screen.
+        const int fps_in = owner ? owner->arrivedFps() : 0;
+        const int fps_shown = owner ? owner->shownFps() : -1;
+        fpsRow->setVisible(hasSession && fps_in > 0);
+        fpsValue->setText(fps_shown >= 0 ? QStringLiteral("%1 / %2").arg(fps_in).arg(fps_shown)
+                                         : QString::number(fps_in));
+
+        audioRow->setVisible(hasSession);
+        audioValue->setText(hasSession ? tr("%1 ms").arg(session->GetAudioTargetMs(), 0, 'f', 0) : QString());
+
         queueRow->setVisible(true);
         queueDepthValue->setText(QString::number(owner ? owner->queueDepthAverage() : 0.0, 'f', 1));
         pendingRow->setVisible(true);
@@ -283,6 +311,16 @@ private:
     QPointer<QmlBackend> backend;
     QPointer<StreamSession> current_session;
     QWidget *bitrateRow = nullptr;
+    QWidget *askedRow = nullptr;
+    QWidget *targetRow = nullptr;
+    QWidget *roundTripRow = nullptr;
+    QWidget *fpsRow = nullptr;
+    QWidget *audioRow = nullptr;
+    QLabel *askedValue = nullptr;
+    QLabel *targetValue = nullptr;
+    QLabel *roundTripValue = nullptr;
+    QLabel *fpsValue = nullptr;
+    QLabel *audioValue = nullptr;
     QWidget *queueRow = nullptr;
     QWidget *pendingRow = nullptr;
     QWidget *packetLossRow = nullptr;
@@ -2427,6 +2465,16 @@ static bool uses_fsrcnnx(PlaceboUpscaler upscaler)
 }
 
 static constexpr float spatial_upscale_threshold = 1.2f;
+#if defined(Q_OS_WIN)
+// Direct3D 11 presenter: how many decoded pictures may wait for a present
+// slot. Each one waiting is one refresh of delay (16.7 ms at 60 Hz).
+static constexpr size_t NATIVE_FRAME_QUEUE_MAX = 3;
+// Presents in a row that left pictures waiting before one is skipped to
+// catch up: soon when two or more wait, late when it is a single one (a
+// one-picture reserve is what evens out a jittery connection).
+static constexpr int NATIVE_BACKLOG_PRESENTS_DEEP = 30;
+static constexpr int NATIVE_BACKLOG_PRESENTS_ONE = 120;
+#endif
 
 static bool uses_custom_upscale_hook(PlaceboUpscaler upscaler)
 {
@@ -2617,6 +2665,11 @@ QmlMainWindow::~QmlMainWindow()
         clearPendingFrameStateLocked();
     }
     av_frame_free(&direct_pending_frame);
+#if defined(Q_OS_WIN)
+    for (AVFrame *&queued : native_frame_queue)
+        av_frame_free(&queued);
+    native_frame_queue.clear();
+#endif
     {
         QMutexLocker locker(&reset_seed_mutex);
         if (reset_seed_frame)
@@ -3007,14 +3060,46 @@ void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, q
     if (!frame.frame)
         return;
 
+    // Stats overlay: decoded pictures per second.
+    if (stats_arrived_since_us == 0) {
+        stats_arrived_since_us = present_entry_us;
+        stats_arrived_count = 0;
+    } else {
+        stats_arrived_count++;
+        const qint64 span_us = present_entry_us - stats_arrived_since_us;
+        if (span_us >= 1000000) {
+            stats_arrived_fps.store(qRound(stats_arrived_count * 1000000.0 / span_us));
+            stats_arrived_count = 0;
+            stats_arrived_since_us = present_entry_us;
+        }
+    }
+
     if (bypass_frame_queue) {
         {
             QMutexLocker locker(&direct_frame_mutex);
-            if (direct_pending_frame) {
-                av_frame_free(&direct_pending_frame);
-                dropped_frames_current.fetchAndAddRelaxed(1);
+#if defined(Q_OS_WIN)
+            if (render_backend == RenderBackend::Metal) {
+                // Keep a few pictures in order instead of only the newest:
+                // two that arrive within one refresh are shown on two
+                // refreshes. Beyond the limit the oldest goes.
+                if (native_frame_queue.size() >= NATIVE_FRAME_QUEUE_MAX) {
+                    av_frame_free(&native_frame_queue.front());
+                    native_frame_queue.pop_front();
+                    native_queue_overflowed++;
+                    dropped_frames_current.fetchAndAddRelaxed(1);
+                }
+                native_frame_queue.push_back(frame.frame);
+                native_queue_depth_max = std::max(native_queue_depth_max,
+                                                  static_cast<unsigned>(native_frame_queue.size()));
+            } else
+#endif
+            {
+                if (direct_pending_frame) {
+                    av_frame_free(&direct_pending_frame);
+                    dropped_frames_current.fetchAndAddRelaxed(1);
+                }
+                direct_pending_frame = frame.frame;
             }
-            direct_pending_frame = frame.frame;
         }
         if (!startup_warmup_frame_active)
             startup_first_real_frame_queued_pending_visibility.storeRelease(1);
@@ -4618,6 +4703,10 @@ bool QmlMainWindow::hasBufferedWork()
 {
     if (bypass_frame_queue) {
         QMutexLocker locker(&direct_frame_mutex);
+#if defined(Q_OS_WIN)
+        if (!native_frame_queue.empty())
+            return true;
+#endif
         return direct_pending_frame != nullptr;
     }
     if (queue_depth_cached.loadAcquire() > 0)
@@ -5185,6 +5274,11 @@ renderer_backend_ready:
             {
                 QMutexLocker locker(&direct_frame_mutex);
                 av_frame_free(&direct_pending_frame);
+#if defined(Q_OS_WIN)
+                for (AVFrame *&queued : native_frame_queue)
+                    av_frame_free(&queued);
+                native_frame_queue.clear();
+#endif
                 direct_frame_reset.storeRelease(1);
             }
             {
@@ -7934,12 +8028,19 @@ void QmlMainWindow::renderMetal(bool scheduled)
     bool reset_video = false;
     {
         QMutexLocker locker(&direct_frame_mutex);
+#if !defined(Q_OS_WIN)
         std::swap(incoming, direct_pending_frame);
+#endif
         reset_video = direct_frame_reset.fetchAndStoreRelaxed(0) != 0;
     }
     if (reset_video)
         metal_renderer->clearVideo();
+#if defined(Q_OS_WIN)
+    // Taken from the queue further down, once a present slot is free.
+    bool new_frame = false;
+#else
     const bool new_frame = incoming && metal_renderer->setVideoFrame(incoming);
+#endif
 
     const bool quick_needs_render = quick_need_render.fetchAndStoreRelaxed(0) != 0;
     if (quick_needs_render || quick_frame) {
@@ -7976,9 +8077,86 @@ void QmlMainWindow::renderMetal(bool scheduled)
         }
         return;
     }
+#if defined(Q_OS_WIN)
+    // The slot is free: show the oldest waiting picture. The ones behind it
+    // stay queued and follow on the next refreshes (presented callback).
+    bool more_waiting = false;
+    {
+        unsigned shown = 0, overflowed = 0, caught_up = 0, waited = 0, depth_max = 0;
+        bool log_queue = false;
+        {
+            QMutexLocker locker(&direct_frame_mutex);
+            if (!native_frame_queue.empty()) {
+                incoming = native_frame_queue.front();
+                native_frame_queue.pop_front();
+                const size_t behind = native_frame_queue.size();
+                if (behind == 0) {
+                    native_backlog_presents = 0;
+                } else if (++native_backlog_presents >= (behind >= 2 ? NATIVE_BACKLOG_PRESENTS_DEEP
+                                                                      : NATIVE_BACKLOG_PRESENTS_ONE)) {
+                    // Pictures have been waiting on every refresh for a
+                    // while: that is delay, not smoothing. Skip one.
+                    av_frame_free(&incoming);
+                    incoming = native_frame_queue.front();
+                    native_frame_queue.pop_front();
+                    native_backlog_presents = 0;
+                    native_queue_caught_up++;
+                    dropped_frames_current.fetchAndAddRelaxed(1);
+                }
+                if (behind > 0)
+                    native_queue_waited++;
+                native_queue_shown++;
+            }
+            more_waiting = !native_frame_queue.empty();
+            if (render_entry_us - native_queue_log_us >= 10 * 1000 * 1000) {
+                log_queue = native_queue_log_us != 0 && native_queue_shown > 0;
+                shown = native_queue_shown;
+                overflowed = native_queue_overflowed;
+                caught_up = native_queue_caught_up;
+                waited = native_queue_waited;
+                depth_max = native_queue_depth_max;
+                native_queue_shown = native_queue_overflowed = native_queue_caught_up = 0;
+                native_queue_waited = native_queue_depth_max = 0;
+                native_queue_log_us = render_entry_us;
+            }
+        }
+        if (log_queue)
+            qCInfo(chiakiGui).nospace()
+                << "[d3d11-queue] 10s: " << shown << " pictures shown, " << waited
+                << " with another one waiting behind, most waiting at once " << depth_max
+                << ", skipped: " << overflowed << " (queue full), " << caught_up << " (catching up)";
+    }
+    new_frame = incoming && metal_renderer->setVideoFrame(incoming);
+    if (new_frame && !has_video && loading_transition_complete.loadAcquire() == 0 &&
+        startup_video_visible_pending.loadAcquire() == 0)
+        startup_video_visible_pending.storeRelease(1);
+    // Stats overlay: new pictures per second that reach a present.
+    if (stats_shown_since_us == 0) {
+        stats_shown_since_us = render_entry_us;
+        stats_shown_count = 0;
+    } else {
+        if (new_frame)
+            stats_shown_count++;
+        const qint64 span_us = render_entry_us - stats_shown_since_us;
+        if (span_us >= 1000000) {
+            stats_shown_fps.store(qRound(stats_shown_count * 1000000.0 / span_us));
+            stats_shown_count = 0;
+            stats_shown_since_us = render_entry_us;
+        }
+    }
+#endif
     const qint64 present_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
     const bool presented = metal_renderer->render(metal_renderer->hasVideoFrame(), true, fit, zoom_factor);
     const qint64 present_end_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+#if defined(Q_OS_WIN)
+    if (more_waiting) {
+        // Draw the next waiting picture as soon as this present lands. The
+        // present can land before the flag is armed, hence the second look.
+        metal_present_deferred.storeRelease(1);
+        if (metal_renderer->presentSlotFree(false) && metal_present_deferred.testAndSetAcquire(1, 0))
+            scheduleDeferredMetalRender();
+    }
+#endif
     if (presented) {
         logLatencyStats("metal_render", present_end_us - present_begin_us);
         last_present_complete_us.storeRelease(present_end_us);
