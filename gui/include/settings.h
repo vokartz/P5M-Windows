@@ -346,6 +346,11 @@ class Settings : public QObject
 		void SetBitrateLocalPS5(unsigned int bitrate);
 		void SetBitrateRemotePS5(unsigned int bitrate);
 
+		unsigned int GetLearnMinRemoteKbps() const;
+		unsigned int GetLearnMaxRemoteKbps() const;
+		void SetLearnMinRemoteKbps(unsigned int kbps);
+		void SetLearnMaxRemoteKbps(unsigned int kbps);
+
 		ChiakiCodec GetCodecPS4() const;
 		ChiakiCodec GetCodecLocalPS5() const;
 		ChiakiCodec GetCodecRemotePS5() const;

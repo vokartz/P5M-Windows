@@ -595,6 +595,28 @@ void Settings::SetBitrateRemotePS5(unsigned int bitrate)
 	settings.setValue("settings/bitrate_remote_ps5", bitrate);
 }
 
+// The range the learned bitrate stays in when playing away from home
+// (see StreamSession::LearnFromSession). Ceiling 0 = no ceiling.
+unsigned int Settings::GetLearnMinRemoteKbps() const
+{
+	return settings.value("settings/learn_min_remote_kbps", 5000).toUInt();
+}
+
+unsigned int Settings::GetLearnMaxRemoteKbps() const
+{
+	return settings.value("settings/learn_max_remote_kbps", 0).toUInt();
+}
+
+void Settings::SetLearnMinRemoteKbps(unsigned int kbps)
+{
+	settings.setValue("settings/learn_min_remote_kbps", kbps);
+}
+
+void Settings::SetLearnMaxRemoteKbps(unsigned int kbps)
+{
+	settings.setValue("settings/learn_max_remote_kbps", kbps);
+}
+
 static const QMap<ChiakiCodec, QString> codecs = {
 	{ CHIAKI_CODEC_H264, "h264" },
 	{ CHIAKI_CODEC_H265, "h265" },

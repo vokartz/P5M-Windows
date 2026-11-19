@@ -48,6 +48,8 @@ class QmlSettings : public QObject
     Q_PROPERTY(int bitrateRemotePS4 READ bitrateRemotePS4 WRITE setBitrateRemotePS4 NOTIFY bitrateRemotePS4Changed)
     Q_PROPERTY(int bitrateLocalPS5 READ bitrateLocalPS5 WRITE setBitrateLocalPS5 NOTIFY bitrateLocalPS5Changed)
     Q_PROPERTY(int bitrateRemotePS5 READ bitrateRemotePS5 WRITE setBitrateRemotePS5 NOTIFY bitrateRemotePS5Changed)
+    Q_PROPERTY(int learnMinRemoteKbps READ learnMinRemoteKbps WRITE setLearnMinRemoteKbps NOTIFY learnMinRemoteKbpsChanged)
+    Q_PROPERTY(int learnMaxRemoteKbps READ learnMaxRemoteKbps WRITE setLearnMaxRemoteKbps NOTIFY learnMaxRemoteKbpsChanged)
     Q_PROPERTY(int codecLocalPS5 READ codecLocalPS5 WRITE setCodecLocalPS5 NOTIFY codecLocalPS5Changed)
     Q_PROPERTY(int codecRemotePS5 READ codecRemotePS5 WRITE setCodecRemotePS5 NOTIFY codecRemotePS5Changed)
     Q_PROPERTY(int audioBufferSize READ audioBufferSize WRITE setAudioBufferSize NOTIFY audioBufferSizeChanged)
@@ -282,6 +284,10 @@ public:
     void setBitrateLocalPS5(int bitrate);
     int bitrateRemotePS5() const;
     void setBitrateRemotePS5(int bitrate);
+    int learnMinRemoteKbps() const;
+    void setLearnMinRemoteKbps(int kbps);
+    int learnMaxRemoteKbps() const;
+    void setLearnMaxRemoteKbps(int kbps);
 
     int codecLocalPS5() const;
     void setCodecLocalPS5(int codec);
@@ -668,6 +674,8 @@ signals:
     void bitrateRemotePS4Changed();
     void bitrateLocalPS5Changed();
     void bitrateRemotePS5Changed();
+    void learnMinRemoteKbpsChanged();
+    void learnMaxRemoteKbpsChanged();
     void codecLocalPS5Changed();
     void codecRemotePS5Changed();
     void vulkanDeferredSwapChanged();

@@ -1623,6 +1623,68 @@ DialogView {
                                     KeyNavigation.AfterItem
                             }
                         }
+
+                    // P5M range: the bitrate P5M learns per network stays
+                    // between these two when playing away from home.
+                    Label {
+                        Layout.alignment: Qt.AlignRight
+                        text: qsTr("Away bitrate floor:")
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
+                        text: qsTr("")
+                    }
+
+                    C.Slider {
+                        id: learnMinRemote
+                        Layout.preferredWidth: 200
+                        from: 2
+                        to: 50
+                        stepSize: 1
+                        value: Chiaki.settings.learnMinRemoteKbps / 1000
+                        onMoved: Chiaki.settings.learnMinRemoteKbps = value * 1000;
+                        lastInFocusChain: true
+
+                        Label {
+                            anchors {
+                                left: parent.right
+                                verticalCenter: parent.verticalCenter
+                                leftMargin: 10
+                            }
+                            text: (parent.value) + qsTr(" Mbps")
+                        }
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
+                        text: qsTr("Away bitrate ceiling:")
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
+                        text: qsTr("")
+                    }
+
+                    C.Slider {
+                        id: learnMaxRemote
+                        Layout.preferredWidth: 200
+                        from: 0
+                        to: 100
+                        stepSize: 1
+                        value: Chiaki.settings.learnMaxRemoteKbps / 1000
+                        onMoved: Chiaki.settings.learnMaxRemoteKbps = value * 1000;
+                        lastInFocusChain: true
+
+                        Label {
+                            anchors {
+                                left: parent.right
+                                verticalCenter: parent.verticalCenter
+                                leftMargin: 10
+                            }
+                            text: parent.value > 0 ? (parent.value) + qsTr(" Mbps") : qsTr("No limit")
+                        }
+                    }
                     }
                 }
             }

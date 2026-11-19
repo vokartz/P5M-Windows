@@ -479,6 +479,28 @@ void QmlSettings::setBitrateRemotePS5(int bitrate)
     emit bitrateRemotePS5Changed();
 }
 
+int QmlSettings::learnMinRemoteKbps() const
+{
+    return settings->GetLearnMinRemoteKbps();
+}
+
+void QmlSettings::setLearnMinRemoteKbps(int kbps)
+{
+    settings->SetLearnMinRemoteKbps(kbps < 0 ? 0 : kbps);
+    emit learnMinRemoteKbpsChanged();
+}
+
+int QmlSettings::learnMaxRemoteKbps() const
+{
+    return settings->GetLearnMaxRemoteKbps();
+}
+
+void QmlSettings::setLearnMaxRemoteKbps(int kbps)
+{
+    settings->SetLearnMaxRemoteKbps(kbps < 0 ? 0 : kbps);
+    emit learnMaxRemoteKbpsChanged();
+}
+
 int QmlSettings::codecLocalPS5() const
 {
     return settings->GetCodecLocalPS5();
@@ -1983,6 +2005,8 @@ void QmlSettings::refreshAllKeys()
     emit bitrateRemotePS4Changed();
     emit bitrateLocalPS5Changed();
     emit bitrateRemotePS5Changed();
+    emit learnMinRemoteKbpsChanged();
+    emit learnMaxRemoteKbpsChanged();
     emit codecLocalPS5Changed();
     emit codecRemotePS5Changed();
     emit audioBufferSizeChanged();

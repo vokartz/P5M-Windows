@@ -63,6 +63,8 @@
 #endif
 // Highest bitrate the learning will ask the PS5 for (kbps).
 static constexpr unsigned LEARN_MAX_KBPS = 100000;
+// No packets for this long while connected = the stream froze.
+static constexpr int LEARN_STALL_MS = 4000;
 
 #if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
 class SdeckHapticsWorker : public QObject
@@ -331,6 +333,8 @@ StreamSessionConnectInfo::StreamSessionConnectInfo(
 	this->port_guess_count = settings->GetPortGuessCount();
 	this->port_guess_socket_count = settings->GetPortGuessSocketCount();
 	this->packet_loss_max = settings->GetPacketLossReportedMax();
+	this->learn_min_remote_kbps = settings->GetLearnMinRemoteKbps();
+	this->learn_max_remote_kbps = settings->GetLearnMaxRemoteKbps();
 	this->audio_video_disabled = settings->GetAudioVideoDisabled();
 	// P5M: the PS5's own vibration setting is the one control; a second
 	// scale here only doubled it (and a stale value silently weakened it).
@@ -516,8 +520,24 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 			QSettings learn;
 			learn_cap_kbps = learn.value(learn_key + QStringLiteral("/bad_kbps"), 0).toUInt();
 			const unsigned learned = learn.value(learn_key + QStringLiteral("/bitrate_kbps"), 0).toUInt();
+			// P5M range: away from home the learned bitrate stays between the
+			// floor and the ceiling from the settings (ceiling 0 = none). The
+			// floor never sits above the bitrate the settings ask for, so a
+			// low resolution keeps its low bitrate. At home the old limits apply.
+			const unsigned asked = static_cast<unsigned>(chiaki_connect_info.video_profile.bitrate);
+			learn_floor_kbps = std::min(8000u, asked);
+			learn_ceiling_kbps = LEARN_MAX_KBPS;
+			if(!local)
+			{
+				if(connect_info.learn_min_remote_kbps)
+					learn_floor_kbps = std::min(static_cast<unsigned>(connect_info.learn_min_remote_kbps), asked);
+				if(connect_info.learn_max_remote_kbps)
+					learn_ceiling_kbps = std::min(std::max(static_cast<unsigned>(connect_info.learn_max_remote_kbps), learn_floor_kbps), LEARN_MAX_KBPS);
+			}
 			if(learned)
 				chiaki_connect_info.video_profile.bitrate = std::min(learned, LEARN_MAX_KBPS);
+			if(!local)
+				chiaki_connect_info.video_profile.bitrate = std::min(std::max(static_cast<unsigned>(chiaki_connect_info.video_profile.bitrate), learn_floor_kbps), learn_ceiling_kbps);
 			learn_used_kbps = chiaki_connect_info.video_profile.bitrate;
 			const double queue = learn.value(learn_key + QStringLiteral("/audio_queue_ms"), 0).toDouble();
 			if(queue > 0)
@@ -728,6 +748,22 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 	packet_loss_timer->setInterval(200);
 	packet_loss_timer->start();
 	connect(packet_loss_timer, &QTimer::timeout, this, [this]() {
+		// P5M range: notice a stream that froze. Packets that stop arriving
+		// for LEARN_STALL_MS while connected (and nobody asked to stop) mean
+		// the network could not carry this bitrate, however short the session.
+		const uint64_t rx_now = session.stream_connection.congestion_control.total_received;
+		if(rx_now != learn_last_rx)
+		{
+			learn_last_rx = rx_now;
+			learn_last_rx_timer.start();
+		}
+		else if(connected && !learn_stalled && !learn_stop_requested.load() && !shutting_down.load()
+			&& learn_last_rx_timer.isValid() && learn_last_rx_timer.elapsed() > LEARN_STALL_MS)
+		{
+			learn_stalled = true;
+			CHIAKI_LOGI(log.GetChiakiLog(), "[learn] the stream froze for %d ms at %u kbps: the next session will ask for less",
+				LEARN_STALL_MS, learn_used_kbps);
+		}
 		if(packet_loss_history.size() > 10)
 			packet_loss_history.takeFirst();
 		packet_loss_history.append(session.stream_connection.congestion_control.packet_loss);
@@ -761,12 +797,18 @@ void StreamSession::LearnFromSession()
 	const double minutes = learn_timer.elapsed() / 60000.0;
 	QSettings learn;
 	learn.setValue(learn_key + QStringLiteral("/audio_queue_ms"), audio_target_ms.load());
-	if(minutes < 1.0)
+	// P5M range: a stream that froze, or that the console dropped, is a
+	// verdict on the bitrate however short the session was. Without one of
+	// those, under a minute is too short to judge.
+	const bool stalled = learn_stalled;
+	const bool dropped = learn_quit_error.load();
+	const bool judged = minutes >= 1.0;
+	if(!judged && !stalled && !dropped)
 		return; // too short to judge the bitrate
 	const uint64_t rx = session.stream_connection.congestion_control.total_received;
 	const uint64_t lost = session.stream_connection.congestion_control.total_lost;
 	const double loss = rx + lost ? double(lost) / double(rx + lost) : 0.0;
-	const double lost_per_min = frames_lost / minutes;
+	const double lost_per_min = judged ? frames_lost / minutes : 0.0;
 	// learn_cap_kbps is the lowest bitrate that lost packets on this
 	// network (0 = none yet). Climb by a fifth while nothing is known,
 	// then halfway to that point; on loss, step back and mark it.
@@ -774,16 +816,20 @@ void StreamSession::LearnFromSession()
 	int clean_at_top = learn.value(learn_key + QStringLiteral("/clean_at_top"), 0).toInt();
 	unsigned next = learn_used_kbps;
 	const char *what = "kept";
-	if(loss > 0.01 || lost_per_min > 3)
+	if(stalled || (!judged && dropped) || (judged && (loss > 0.01 || lost_per_min > 3)))
 	{
 		bad = bad ? std::min(bad, learn_used_kbps) : learn_used_kbps;
-		next = std::max(8000u, unsigned(learn_used_kbps * 0.85));
+		// A freeze or an early drop is a harder verdict than a few lost
+		// packets: step back further. Never below the floor of the range.
+		const bool hard = stalled || !judged;
+		next = std::max(std::min(learn_floor_kbps, learn_used_kbps), unsigned(learn_used_kbps * (hard ? 0.75 : 0.85)));
 		clean_at_top = 0;
-		what = "lowered";
+		what = stalled ? "lowered (the stream froze)" : (!judged ? "lowered (dropped early)" : "lowered");
 	}
-	else if(loss < 0.002 && lost_per_min < 0.5)
+	else if(!dropped && loss < 0.002 && lost_per_min < 0.5)
 	{
-		unsigned up = std::min(LEARN_MAX_KBPS, unsigned(learn_used_kbps * 1.2));
+		// (A session the console dropped is never a reason to climb.)
+		unsigned up = std::min(learn_ceiling_kbps, unsigned(learn_used_kbps * 1.2));
 		if(bad)
 		{
 			up = std::min(up, learn_used_kbps + (bad > learn_used_kbps ? (bad - learn_used_kbps) / 2 : 0));
@@ -795,7 +841,7 @@ void StreamSession::LearnFromSession()
 				{
 					bad = 0;
 					clean_at_top = 0;
-					up = std::min(LEARN_MAX_KBPS, unsigned(learn_used_kbps * 1.1));
+					up = std::min(learn_ceiling_kbps, unsigned(learn_used_kbps * 1.1));
 				}
 				else
 					up = learn_used_kbps;
@@ -973,11 +1019,13 @@ void StreamSession::Start()
 void StreamSession::Stop()
 {
 	mic_active.storeRelaxed(false);
+	learn_stop_requested.store(true); // packets stopping from here on is not a freeze
 	chiaki_session_stop(&session);
 }
 
 void StreamSession::GoToBed()
 {
+	learn_stop_requested.store(true);
 	chiaki_session_goto_bed(&session);
 }
 
@@ -2829,6 +2877,7 @@ void StreamSession::Event(ChiakiEvent *event)
 				return;
 			}
 			connected = false;
+			learn_quit_error.store(chiaki_quit_reason_is_error(event->quit.reason));
 			QMetaObject::invokeMethod(this, [this]() { LearnFromSession(); }, Qt::QueuedConnection);
 			emit ConnectedChanged();
 			emit SessionQuit(event->quit.reason, event->quit.reason_str ? QString::fromUtf8(event->quit.reason_str) : QString());

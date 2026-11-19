@@ -94,6 +94,9 @@ class SdeckHapticsWorker;
 		QString initial_login_pin;
 		ChiakiConnectVideoProfile video_profile;
 		double packet_loss_max;
+		// P5M range for the learned bitrate away from home (0 = no ceiling).
+		unsigned int learn_min_remote_kbps = 0;
+		unsigned int learn_max_remote_kbps = 0;
 		unsigned int audio_buffer_size;
 		int audio_volume;
 		bool mac_spatial_audio = true;
@@ -353,6 +356,16 @@ class StreamSession : public QObject
 		unsigned learn_cap_kbps = 0, learn_used_kbps = 0;
 		QElapsedTimer learn_timer;
 		bool learn_saved = false;
+		// P5M range: the learned bitrate stays between floor and ceiling. A
+		// stream that froze (no packets for a few seconds while connected), or
+		// that the console dropped, counts against the bitrate even when the
+		// session was too short for the loss figures.
+		unsigned learn_floor_kbps = 8000, learn_ceiling_kbps = 100000;
+		uint64_t learn_last_rx = 0;
+		QElapsedTimer learn_last_rx_timer;
+		bool learn_stalled = false;
+		std::atomic<bool> learn_stop_requested { false };
+		std::atomic<bool> learn_quit_error { false };
 		void LearnFromSession();
 
 		void StartAudioOutDrainThread();
