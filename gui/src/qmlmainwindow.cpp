@@ -7992,6 +7992,9 @@ bool QmlMainWindow::initMetal()
         scheduleUpdate(false, UpdateRequestReason::VSync);
     });
     metal_renderer->setVSync(settings->GetVSyncEnabled());
+#if defined(Q_OS_WIN)
+    metal_renderer->setSmoothing(settings->GetD3D11Smoothing());
+#endif
     metal_renderer->setHdr(settings->GetHdrOutputEnabled());
     metal_renderer->setPresentedCallback([this]() {
         if (!metal_present_deferred.testAndSetAcquire(1, 0))

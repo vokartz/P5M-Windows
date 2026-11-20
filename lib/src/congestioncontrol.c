@@ -15,7 +15,10 @@ static void *congestion_control_thread_func(void *user)
 
 	while(true)
 	{
-		err = chiaki_bool_pred_cond_timedwait(&control->stop_cond, CONGESTION_CONTROL_INTERVAL_MS);
+		uint32_t interval_ms = control->interval_ms;
+		if(!interval_ms)
+			interval_ms = CONGESTION_CONTROL_INTERVAL_MS;
+		err = chiaki_bool_pred_cond_timedwait(&control->stop_cond, interval_ms);
 		if(err != CHIAKI_ERR_TIMEOUT)
 			break;
 
@@ -53,6 +56,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_congestion_control_start(ChiakiCongestionCo
 	control->packet_loss = 0;
 	control->total_received = 0;
 	control->total_lost = 0;
+	control->interval_ms = CONGESTION_CONTROL_INTERVAL_MS;
 
 	ChiakiErrorCode err = chiaki_bool_pred_cond_init(&control->stop_cond);
 	if(err != CHIAKI_ERR_SUCCESS)

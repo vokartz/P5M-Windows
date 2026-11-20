@@ -6,12 +6,20 @@
 #include <string.h>
 
 #define FEEDBACK_STATE_TIMEOUT_MIN_MS 8 // minimum time to wait between sending 2 packets
-#define FEEDBACK_STATE_TIMEOUT_MAX_MS 200 // maximum time to wait between sending 2 packets
+// Maximum time to wait between sending 2 packets. These packets are not
+// acknowledged: when the one that carried the last stick position is lost,
+// the console keeps the older position until the next one. At 200 ms a lost
+// packet meant up to 200 ms of a stale stick; at one frame it heals in 16 ms
+// (about 60 small packets a second while nothing moves).
+#define FEEDBACK_STATE_TIMEOUT_MAX_MS 16
 
 #define FEEDBACK_HISTORY_BUFFER_SIZE 0x10
 #define FEEDBACK_HISTORY_RESEND_EVENT_COUNT 0x4
-#define FEEDBACK_HISTORY_TAIL_RESENDS 3
-#define FEEDBACK_HISTORY_TAIL_RESEND_MS 30
+// A button press or release is sent at once and then repeated, in case the
+// first packet is lost: 4 repeats 10 ms apart (was 3 repeats 30 ms apart), so
+// a lost press arrives 10 ms late instead of 30.
+#define FEEDBACK_HISTORY_TAIL_RESENDS 4
+#define FEEDBACK_HISTORY_TAIL_RESEND_MS 10
 
 static void *feedback_sender_thread_func(void *user);
 static void feedback_sender_send_state(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state);

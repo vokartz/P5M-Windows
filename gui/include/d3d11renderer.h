@@ -51,6 +51,9 @@ public:
 	QSize pixelSize() const;
 
 	void setVSync(bool enabled);
+	// 0 = off, up to 100: how large a step in brightness still counts as a
+	// block edge or a band to be smoothed (settings/d3d11_smoothing).
+	void setSmoothing(int percent);
 	void setSourceFrameRate(double fps);
 	void setRefreshCallback(std::function<void()> callback);
 	// HDR10 output (PQ, BT.2020) when the display has HDR on in Windows;

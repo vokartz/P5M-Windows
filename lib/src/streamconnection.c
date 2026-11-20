@@ -93,6 +93,8 @@ static void p5m_bitrate_janela(ChiakiStreamConnection *sc, int32_t alvo, double 
 
 #define STREAM_CONNECTION_PORT 9296
 // How long a remote (PSN) session waits for a missing AV packet.
+// How often the congestion report goes out when the console names no interval.
+#define STREAM_CONNECTION_REPORT_INTERVAL_FALLBACK_MS 100
 #define STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_US 60000
 #define STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_MIN_US 30000
 #define STREAM_CONNECTION_REMOTE_REORDER_TIMEOUT_MAX_US 120000
@@ -1368,6 +1370,30 @@ static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnecti
 		CHIAKI_LOGW(stream_connection->log, "StreamConnection expected streaminfo payload but received something else");
 		chiaki_log_hexdump(stream_connection->log, CHIAKI_LOG_WARNING, buf, buf_size);
 		return;
+	}
+
+	// The console says how often it wants the congestion report (received /
+	// lost packet counts). This client used to send it every 200 ms whatever
+	// the console asked. The round trip the console reports back fits that
+	// exactly: about 35 ms measured at connect, but 120-140 ms on average
+	// and 240-260 ms at most while streaming, at 5, 8 and 9 Mbps alike:
+	// the real round trip plus the wait for the next report. So follow the
+	// console's figure, and without one report twice as often.
+	CHIAKI_LOGI(stream_connection->log, "[streaminfo] console asks for: congestion report every %s%u ms, start timeout %s%u, afk timeout %s%u",
+			msg.stream_info_payload.has_congestion_control_interval ? "" : "(not sent) ",
+			(unsigned)msg.stream_info_payload.congestion_control_interval,
+			msg.stream_info_payload.has_start_timeout ? "" : "(not sent) ",
+			(unsigned)msg.stream_info_payload.start_timeout,
+			msg.stream_info_payload.has_afk_timeout ? "" : "(not sent) ",
+			(unsigned)msg.stream_info_payload.afk_timeout);
+	{
+		uint32_t report_ms = STREAM_CONNECTION_REPORT_INTERVAL_FALLBACK_MS;
+		if(msg.stream_info_payload.has_congestion_control_interval
+			&& msg.stream_info_payload.congestion_control_interval >= 16
+			&& msg.stream_info_payload.congestion_control_interval <= 200)
+			report_ms = msg.stream_info_payload.congestion_control_interval;
+		stream_connection->congestion_control.interval_ms = report_ms;
+		CHIAKI_LOGI(stream_connection->log, "[streaminfo] sending the congestion report every %u ms", (unsigned)report_ms);
 	}
 
 	CHIAKI_LOGI(stream_connection->log, "StreamConnection received audio header:");

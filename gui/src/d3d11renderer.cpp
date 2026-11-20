@@ -11,6 +11,7 @@
 
 #include "d3d11renderer.h"
 
+#include <QByteArray>
 #include <QLoggingCategory>
 #include <QQuickGraphicsDevice>
 #include <QQuickRenderTarget>
@@ -109,10 +110,42 @@ float3 tone_map(float3 nits)
 	return x * (min(y, 1.0) / m);
 }
 
+#ifdef SMOOTH
+// Optional variant (compiled apart; the plain shader stays the fallback).
+// The blocks and bands of an encoder short of bits are small steps in flat
+// areas. Where the luma within 4 pixels varies by less than the threshold
+// (pad), the pixel is blended towards the average of that surrounding; real
+// edges and texture vary more than the threshold and are left as they are.
+float smooth_luma(float2 uv)
+{
+	float w, h;
+	t0.GetDimensions(w, h);
+	float2 px = float2(1.0 / w, 1.0 / h);
+	float c = t0.Sample(s, uv).r;
+	float x1 = t0.Sample(s, uv + float2(-3.5, 0.0) * px).r;
+	float x2 = t0.Sample(s, uv + float2(-1.5, 0.0) * px).r;
+	float x3 = t0.Sample(s, uv + float2(1.5, 0.0) * px).r;
+	float x4 = t0.Sample(s, uv + float2(3.5, 0.0) * px).r;
+	float y1 = t0.Sample(s, uv + float2(0.0, -3.5) * px).r;
+	float y2 = t0.Sample(s, uv + float2(0.0, -1.5) * px).r;
+	float y3 = t0.Sample(s, uv + float2(0.0, 1.5) * px).r;
+	float y4 = t0.Sample(s, uv + float2(0.0, 3.5) * px).r;
+	float lo = min(c, min(min(min(x1, x2), min(x3, x4)), min(min(y1, y2), min(y3, y4))));
+	float hi = max(c, max(max(max(x1, x2), max(x3, x4)), max(max(y1, y2), max(y3, y4))));
+	float k = saturate(1.0 - (hi - lo) * yscale / max(pad, 0.0001));
+	float avg = (2.0 * c + x1 + x2 + x3 + x4 + y1 + y2 + y3 + y4) / 10.0;
+	return lerp(c, avg, k);
+}
+#endif
+
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
 	float3 yuv;
+#ifdef SMOOTH
+	yuv.x = smooth_luma(uv);
+#else
 	yuv.x = t0.Sample(s, uv).r;
+#endif
 	if (planar)
 		yuv.yz = float2(t1.Sample(s, uv).r, t2.Sample(s, uv).r);
 	else
@@ -248,6 +281,10 @@ struct D3D11Renderer::Impl
 
 	ComPtr<ID3D11VertexShader> vs;
 	ComPtr<ID3D11PixelShader> ps_video, ps_overlay, ps_coverage;
+	// Video shader that also smooths small luma steps (blocks, bands); null
+	// if it failed to compile. Used while smooth_threshold is above zero.
+	ComPtr<ID3D11PixelShader> ps_video_smooth;
+	std::atomic<float> smooth_threshold{0.0f};
 	ComPtr<ID3D11BlendState> blend_nowrite;
 
 	// UI coverage (see kCoverageShader).
@@ -439,6 +476,16 @@ struct D3D11Renderer::Impl
 		    || FAILED(device->CreatePixelShader(psv->GetBufferPointer(), psv->GetBufferSize(), nullptr, &ps_video))
 		    || FAILED(device->CreatePixelShader(pso->GetBufferPointer(), pso->GetBufferSize(), nullptr, &ps_overlay)))
 			return false;
+
+		// The smoothing variant of the video shader. Optional: if it does not
+		// compile, the plain one above draws the video as before.
+		const QByteArray smooth_source = QByteArray("#define SMOOTH 1\n") + QByteArray(kVideoShader);
+		if (ComPtr<ID3DBlob> pss = compileShader(smooth_source.constData(), "ps_5_0")) {
+			if (FAILED(device->CreatePixelShader(pss->GetBufferPointer(), pss->GetBufferSize(), nullptr, &ps_video_smooth)))
+				ps_video_smooth.Reset();
+		}
+		if (!ps_video_smooth)
+			qCWarning(chiakiGui) << "D3D11 renderer: the smoothing shader is unavailable; video is drawn without it";
 
 		D3D11_SAMPLER_DESC sd = {};
 		sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -809,6 +856,16 @@ void D3D11Renderer::setVSync(bool enabled)
 	d->vsync.store(enabled);
 }
 
+void D3D11Renderer::setSmoothing(int percent)
+{
+	// 0 = off. 100 = luma steps up to 6% of full range are smoothed; 50 is
+	// 3%, about what a block edge or a band is at a low bitrate.
+	const float threshold = qBound(0, percent, 100) * 0.0006f;
+	d->smooth_threshold.store(threshold);
+	qCInfo(chiakiGui).nospace() << "D3D11 renderer: smoothing " << qBound(0, percent, 100) << "% ("
+	                            << (threshold > 0.0f ? (d->ps_video_smooth ? "on" : "asked for, but the shader is unavailable") : "off") << ")";
+}
+
 void D3D11Renderer::setSourceFrameRate(double)
 {
 	// The waitable object paces presents; nothing to tune per source rate yet.
@@ -933,10 +990,13 @@ bool D3D11Renderer::render(bool draw_video, bool draw_overlay, Fit fit, float zo
 		D3D11_VIEWPORT vp = { float(r.x()), float(r.y()), float(r.width()), float(r.height()), 0, 1 };
 		ctx->RSSetViewports(1, &vp);
 		d->video_constants.output = d->hdr_output ? 1 : 0;
+		const float smooth = d->smooth_threshold.load();
+		const bool use_smooth = smooth > 0.0f && d->ps_video_smooth;
+		d->video_constants.pad = use_smooth ? smooth : 0.0f;
 		ctx->UpdateSubresource(cb, 0, nullptr, &d->video_constants, 0, 0);
 		ID3D11ShaderResourceView *srvs[3] = { d->video_srv[0].Get(), d->video_srv[1].Get(), d->video_srv[2].Get() };
 		ctx->PSSetShaderResources(0, 3, srvs);
-		ctx->PSSetShader(d->ps_video.Get(), nullptr, 0);
+		ctx->PSSetShader(use_smooth ? d->ps_video_smooth.Get() : d->ps_video.Get(), nullptr, 0);
 		ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
 		ctx->Draw(3, 0);
 	}

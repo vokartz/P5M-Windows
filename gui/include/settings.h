@@ -266,6 +266,8 @@ class Settings : public QObject
 		void SetLogSanitize(bool enabled)      { settings.setValue("settings/log_sanitize", enabled); }
 		bool GetVSyncEnabled() const           { return settings.value("settings/vsync", false).toBool(); }
 		void SetVSyncEnabled(bool enabled)     { settings.setValue("settings/vsync", enabled); }
+		// Direct3D 11 presenter: smoothing of block edges and bands, 0 (off) to 100.
+		int GetD3D11Smoothing() const          { return settings.value("settings/d3d11_smoothing", 0).toInt(); }
 		// P5M (macOS, Metal): experimental HDR output on screens that have it.
 		bool GetHdrOutputEnabled() const       { return settings.value("settings/hdr_output", false).toBool(); }
 		void SetHdrOutputEnabled(bool enabled) { settings.setValue("settings/hdr_output", enabled); }
