@@ -468,6 +468,10 @@ private:
     // pictures arrive in pairs and gaps; with a single "newest wins" slot the
     // first of each pair was never shown.
     std::deque<AVFrame *> native_frame_queue;
+    // When each waiting picture arrived (same order), to measure the wait.
+    std::deque<qint64> native_frame_queue_arrival_us;
+    qint64 native_queue_wait_sum_us = 0;
+    qint64 native_queue_wait_max_us = 0;
     // Presents in a row that left pictures waiting (render thread only).
     int native_backlog_presents = 0;
     // Diary, reset every 10 s (guarded by direct_frame_mutex).

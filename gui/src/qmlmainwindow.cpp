@@ -2468,12 +2468,15 @@ static constexpr float spatial_upscale_threshold = 1.2f;
 #if defined(Q_OS_WIN)
 // Direct3D 11 presenter: how many decoded pictures may wait for a present
 // slot. Each one waiting is one refresh of delay (16.7 ms at 60 Hz).
-static constexpr size_t NATIVE_FRAME_QUEUE_MAX = 3;
+// Two: enough to show a pair that arrives within one refresh in order,
+// without the standing delay a third one added (measured with three: two
+// out of three pictures had another one waiting behind them).
+static constexpr size_t NATIVE_FRAME_QUEUE_MAX = 2;
 // Presents in a row that left pictures waiting before one is skipped to
-// catch up: soon when two or more wait, late when it is a single one (a
-// one-picture reserve is what evens out a jittery connection).
-static constexpr int NATIVE_BACKLOG_PRESENTS_DEEP = 30;
-static constexpr int NATIVE_BACKLOG_PRESENTS_ONE = 120;
+// catch up. Waiting on every present is delay, not smoothing: half a second
+// of it with one picture behind, a sixth with more.
+static constexpr int NATIVE_BACKLOG_PRESENTS_DEEP = 10;
+static constexpr int NATIVE_BACKLOG_PRESENTS_ONE = 30;
 #endif
 
 static bool uses_custom_upscale_hook(PlaceboUpscaler upscaler)
@@ -2669,6 +2672,7 @@ QmlMainWindow::~QmlMainWindow()
     for (AVFrame *&queued : native_frame_queue)
         av_frame_free(&queued);
     native_frame_queue.clear();
+    native_frame_queue_arrival_us.clear();
 #endif
     {
         QMutexLocker locker(&reset_seed_mutex);
@@ -3085,10 +3089,13 @@ void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, q
                 if (native_frame_queue.size() >= NATIVE_FRAME_QUEUE_MAX) {
                     av_frame_free(&native_frame_queue.front());
                     native_frame_queue.pop_front();
+                    if (!native_frame_queue_arrival_us.empty())
+                        native_frame_queue_arrival_us.pop_front();
                     native_queue_overflowed++;
                     dropped_frames_current.fetchAndAddRelaxed(1);
                 }
                 native_frame_queue.push_back(frame.frame);
+                native_frame_queue_arrival_us.push_back(present_entry_us);
                 native_queue_depth_max = std::max(native_queue_depth_max,
                                                   static_cast<unsigned>(native_frame_queue.size()));
             } else
@@ -5278,6 +5285,7 @@ renderer_backend_ready:
                 for (AVFrame *&queued : native_frame_queue)
                     av_frame_free(&queued);
                 native_frame_queue.clear();
+                native_frame_queue_arrival_us.clear();
 #endif
                 direct_frame_reset.storeRelease(1);
             }
@@ -8083,12 +8091,18 @@ void QmlMainWindow::renderMetal(bool scheduled)
     bool more_waiting = false;
     {
         unsigned shown = 0, overflowed = 0, caught_up = 0, waited = 0, depth_max = 0;
+        qint64 wait_sum_us = 0, wait_max_us = 0;
         bool log_queue = false;
         {
             QMutexLocker locker(&direct_frame_mutex);
             if (!native_frame_queue.empty()) {
                 incoming = native_frame_queue.front();
                 native_frame_queue.pop_front();
+                qint64 arrived_us = render_entry_us;
+                if (!native_frame_queue_arrival_us.empty()) {
+                    arrived_us = native_frame_queue_arrival_us.front();
+                    native_frame_queue_arrival_us.pop_front();
+                }
                 const size_t behind = native_frame_queue.size();
                 if (behind == 0) {
                     native_backlog_presents = 0;
@@ -8099,6 +8113,10 @@ void QmlMainWindow::renderMetal(bool scheduled)
                     av_frame_free(&incoming);
                     incoming = native_frame_queue.front();
                     native_frame_queue.pop_front();
+                    if (!native_frame_queue_arrival_us.empty()) {
+                        arrived_us = native_frame_queue_arrival_us.front();
+                        native_frame_queue_arrival_us.pop_front();
+                    }
                     native_backlog_presents = 0;
                     native_queue_caught_up++;
                     dropped_frames_current.fetchAndAddRelaxed(1);
@@ -8106,6 +8124,10 @@ void QmlMainWindow::renderMetal(bool scheduled)
                 if (behind > 0)
                     native_queue_waited++;
                 native_queue_shown++;
+                // How long this picture sat here before a present slot.
+                const qint64 wait_us = std::max<qint64>(0, render_entry_us - arrived_us);
+                native_queue_wait_sum_us += wait_us;
+                native_queue_wait_max_us = std::max(native_queue_wait_max_us, wait_us);
             }
             more_waiting = !native_frame_queue.empty();
             if (render_entry_us - native_queue_log_us >= 10 * 1000 * 1000) {
@@ -8115,8 +8137,11 @@ void QmlMainWindow::renderMetal(bool scheduled)
                 caught_up = native_queue_caught_up;
                 waited = native_queue_waited;
                 depth_max = native_queue_depth_max;
+                wait_sum_us = native_queue_wait_sum_us;
+                wait_max_us = native_queue_wait_max_us;
                 native_queue_shown = native_queue_overflowed = native_queue_caught_up = 0;
                 native_queue_waited = native_queue_depth_max = 0;
+                native_queue_wait_sum_us = native_queue_wait_max_us = 0;
                 native_queue_log_us = render_entry_us;
             }
         }
@@ -8124,7 +8149,9 @@ void QmlMainWindow::renderMetal(bool scheduled)
             qCInfo(chiakiGui).nospace()
                 << "[d3d11-queue] 10s: " << shown << " pictures shown, " << waited
                 << " with another one waiting behind, most waiting at once " << depth_max
-                << ", skipped: " << overflowed << " (queue full), " << caught_up << " (catching up)";
+                << ", skipped: " << overflowed << " (queue full), " << caught_up << " (catching up)"
+                << ", waited for a present slot avg " << QString::number(shown ? wait_sum_us / 1000.0 / shown : 0.0, 'f', 1)
+                << " max " << QString::number(wait_max_us / 1000.0, 'f', 1) << " ms";
     }
     new_frame = incoming && metal_renderer->setVideoFrame(incoming);
     if (new_frame && !has_video && loading_transition_complete.loadAcquire() == 0 &&

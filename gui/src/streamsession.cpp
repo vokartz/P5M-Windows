@@ -922,7 +922,8 @@ void StreamSession::LearnFromSession()
 	else if(!dropped && loss < 0.002 && lost_per_min <= calm_lpm)
 	{
 		// (A session the console dropped is never a reason to climb.)
-		unsigned up = std::min(learn_ceiling_kbps, unsigned(learn_used_kbps * 1.2));
+		// Ten clean minutes are a better witness than two: climb further.
+		unsigned up = std::min(learn_ceiling_kbps, unsigned(learn_used_kbps * (minutes >= 10.0 ? 1.3 : 1.2)));
 		if(bad)
 		{
 			up = std::min(up, learn_used_kbps + (bad > learn_used_kbps ? (bad - learn_used_kbps) / 2 : 0));
@@ -940,6 +941,9 @@ void StreamSession::LearnFromSession()
 					up = learn_used_kbps;
 			}
 		}
+		// Whole Mbps, rounded up: rounding a small step down used to cancel
+		// it ("raised 8000 -> 8000").
+		up = std::min(learn_ceiling_kbps, (up + 999) / 1000 * 1000);
 		if(up > learn_used_kbps)
 		{
 			next = up;

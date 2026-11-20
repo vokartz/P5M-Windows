@@ -36,7 +36,7 @@ static void p5m_bitrate_janela(ChiakiStreamConnection *sc, int32_t alvo, double 
 	static uint64_t inicio_ms = 0;
 	static unsigned relatos = 0;
 	static int32_t alvo_min = 0, alvo_max = 0, alvo_ultimo = 0, alvo_sessao = 0;
-	static double medido_soma = 0.0, medido_max = 0.0, medido_sessao = 0.0, rtt_max = 0.0;
+	static double medido_soma = 0.0, medido_max = 0.0, medido_sessao = 0.0, rtt_max = 0.0, rtt_soma = 0.0;
 	static long long perda_max = 0;
 	uint64_t agora = chiaki_time_now_monotonic_ms();
 	if(dono != sc)
@@ -47,10 +47,11 @@ static void p5m_bitrate_janela(ChiakiStreamConnection *sc, int32_t alvo, double 
 		alvo_sessao = 0;
 		medido_sessao = 0.0;
 		alvo_min = alvo_max = 0;
-		medido_soma = medido_max = rtt_max = 0.0;
+		medido_soma = medido_max = rtt_max = rtt_soma = 0.0;
 		perda_max = 0;
 	}
 	double medido = sc->measured_bitrate;
+	rtt_soma += rtt;
 	if(relatos == 0 || alvo < alvo_min) alvo_min = alvo;
 	if(relatos == 0 || alvo > alvo_max) alvo_max = alvo;
 	if(alvo > alvo_sessao) alvo_sessao = alvo;
@@ -64,14 +65,14 @@ static void p5m_bitrate_janela(ChiakiStreamConnection *sc, int32_t alvo, double 
 	if(agora - inicio_ms < 10000)
 		return;
 	CHIAKI_LOGI(sc->log, "P5M: bitrate 10s: asked %u kbps; console target %d..%d (last %d, session max %d); "
-			"received %.1f Mbps avg, %.1f max (session max %.1f); %u reports, rtt max %.4f, loss max %lld",
+			"received %.1f Mbps avg, %.1f max (session max %.1f); %u reports, rtt avg %.1f, rtt max %.4f, loss max %lld",
 			(unsigned)sc->session->connect_info.video_profile.bitrate,
 			alvo_min, alvo_max, alvo_ultimo, alvo_sessao,
-			medido_soma / relatos, medido_max, medido_sessao, relatos, rtt_max, perda_max);
+			medido_soma / relatos, medido_max, medido_sessao, relatos, rtt_soma / relatos, rtt_max, perda_max);
 	inicio_ms = agora;
 	relatos = 0;
 	alvo_min = alvo_max = 0;
-	medido_soma = medido_max = rtt_max = 0.0;
+	medido_soma = medido_max = rtt_max = rtt_soma = 0.0;
 	perda_max = 0;
 }
 #ifndef _WIN32
