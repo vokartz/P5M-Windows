@@ -399,7 +399,9 @@ PS5SHIM_API Ps5Session *ps5_session_create(const Ps5ConnectInfo *info,
 	ci.video_profile.codec = (ChiakiCodec)info->codec;
 	ci.video_profile_auto_downgrade = true;
 	ci.enable_keyboard = false;
-	ci.enable_dualsense = false;
+	/* P5M does the same: the console then treats the pad as a DualSense (touchpad and motion
+	 * reach PS5 games; with DUALSHOCK4 many PS5 games ignore them) */
+	ci.enable_dualsense = true;
 	ci.packet_loss_max = info->packet_loss_max > 0 ? info->packet_loss_max : 0.05;
 	ci.enable_idr_on_fec_failure = true;
 	s->zero_copy = info->zero_copy != 0;
