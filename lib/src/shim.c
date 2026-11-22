@@ -16,6 +16,12 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/frame.h>
 
+#ifdef _WIN32
+#define COBJMACROS
+#include <d3d11.h>
+#include <libavutil/hwcontext_d3d11va.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +39,10 @@ struct Ps5Session {
 	void *user;
 	uint32_t audio_channels;
 	int session_inited, decoder_inited, opus_inited;
+	int zero_copy;
+#ifdef _WIN32
+	struct D3dConv *conv;        /* zero-copy: NV12 slice -> RGBA ring on the GPU */
+#endif
 };
 
 static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
@@ -43,6 +53,147 @@ static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 }
 
 /* ---- video ---- */
+#ifdef _WIN32
+/* Zero-copy path: D3D11 Video Processor converts the decoded NV12 array slice to an RGBA8
+ * texture (BT.709 limited -> full range RGB) that GL reads through WGL_NV_DX_interop2.
+ * No GPU->RAM copy, no CPU conversion. */
+#define CONV_SLICES 64
+typedef struct D3dConv {
+	AVD3D11VADeviceContext *hw;
+	ID3D11VideoDevice *vdev;
+	ID3D11VideoContext *vctx;
+	ID3D11VideoProcessorEnumerator *venum;
+	ID3D11VideoProcessor *vp;
+	ID3D11Texture2D *out[PS5_D3D11_RING];
+	ID3D11VideoProcessorOutputView *outv[PS5_D3D11_RING];
+	ID3D11Texture2D *in_tex;      /* decoder texture array the input views belong to */
+	ID3D11VideoProcessorInputView *inv[CONV_SLICES];
+	int w, h, next;
+} D3dConv;
+
+static void conv_free(D3dConv *c)
+{
+	if(!c)
+		return;
+	for(int i = 0; i < CONV_SLICES; i++)
+		if(c->inv[i]) ID3D11VideoProcessorInputView_Release(c->inv[i]);
+	for(int i = 0; i < PS5_D3D11_RING; i++)
+	{
+		if(c->outv[i]) ID3D11VideoProcessorOutputView_Release(c->outv[i]);
+		if(c->out[i]) ID3D11Texture2D_Release(c->out[i]);
+	}
+	if(c->vp) ID3D11VideoProcessor_Release(c->vp);
+	if(c->venum) ID3D11VideoProcessorEnumerator_Release(c->venum);
+	if(c->vctx) ID3D11VideoContext_Release(c->vctx);
+	if(c->vdev) ID3D11VideoDevice_Release(c->vdev);
+	free(c);
+}
+
+static D3dConv *conv_new(ChiakiLog *log, AVFrame *f)
+{
+	AVHWFramesContext *fc = (AVHWFramesContext *)f->hw_frames_ctx->data;
+	AVD3D11VADeviceContext *hw = fc->device_ctx->hwctx;
+	D3dConv *c = calloc(1, sizeof(*c));
+	if(!c)
+		return NULL;
+	c->hw = hw;
+	c->w = f->width;
+	c->h = f->height;
+	HRESULT hr = ID3D11Device_QueryInterface(hw->device, &IID_ID3D11VideoDevice, (void **)&c->vdev);
+	if(FAILED(hr)) goto fail;
+	hr = ID3D11DeviceContext_QueryInterface(hw->device_context, &IID_ID3D11VideoContext, (void **)&c->vctx);
+	if(FAILED(hr)) goto fail;
+	D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {0};
+	cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+	cd.InputWidth = c->w; cd.InputHeight = c->h;
+	cd.OutputWidth = c->w; cd.OutputHeight = c->h;
+	cd.InputFrameRate.Numerator = 60; cd.InputFrameRate.Denominator = 1;
+	cd.OutputFrameRate = cd.InputFrameRate;
+	cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+	hr = ID3D11VideoDevice_CreateVideoProcessorEnumerator(c->vdev, &cd, &c->venum);
+	if(FAILED(hr)) goto fail;
+	hr = ID3D11VideoDevice_CreateVideoProcessor(c->vdev, c->venum, 0, &c->vp);
+	if(FAILED(hr)) goto fail;
+	for(int i = 0; i < PS5_D3D11_RING; i++)
+	{
+		D3D11_TEXTURE2D_DESC td = {0};
+		td.Width = c->w; td.Height = c->h;
+		td.MipLevels = 1; td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+		td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+		hr = ID3D11Device_CreateTexture2D(hw->device, &td, NULL, &c->out[i]);
+		if(FAILED(hr)) goto fail;
+		D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov = {0};
+		ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+		hr = ID3D11VideoDevice_CreateVideoProcessorOutputView(c->vdev, (ID3D11Resource *)c->out[i], c->venum, &ov, &c->outv[i]);
+		if(FAILED(hr)) goto fail;
+	}
+	// PS5 SDR stream: BT.709, limited range in; full-range RGB out. No driver "enhancements".
+	D3D11_VIDEO_PROCESSOR_COLOR_SPACE in_cs = {0};
+	in_cs.YCbCr_Matrix = 1;
+	in_cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+	D3D11_VIDEO_PROCESSOR_COLOR_SPACE out_cs = {0};
+	out_cs.RGB_Range = 0;
+	out_cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+	ID3D11VideoContext_VideoProcessorSetStreamColorSpace(c->vctx, c->vp, 0, &in_cs);
+	ID3D11VideoContext_VideoProcessorSetOutputColorSpace(c->vctx, c->vp, &out_cs);
+	ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(c->vctx, c->vp, 0, FALSE);
+	ID3D11VideoContext_VideoProcessorSetStreamFrameFormat(c->vctx, c->vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+	CHIAKI_LOGI(log, "shim: zero-copy D3D11 video processor ready (%dx%d, ring %d)", c->w, c->h, PS5_D3D11_RING);
+	return c;
+fail:
+	CHIAKI_LOGE(log, "shim: zero-copy setup failed (hr 0x%08lx), using the GPU->RAM copy", (unsigned long)hr);
+	conv_free(c);
+	return NULL;
+}
+
+/* Converts one decoded frame; returns the RGBA texture or NULL. Holds the device lock. */
+static ID3D11Texture2D *conv_run(ChiakiLog *log, D3dConv *c, AVFrame *f)
+{
+	ID3D11Texture2D *tex = (ID3D11Texture2D *)f->data[0];
+	int slice = (int)(intptr_t)f->data[1];
+	if(slice < 0 || slice >= CONV_SLICES)
+		return NULL;
+	c->hw->lock(c->hw->lock_ctx);
+	if(tex != c->in_tex)
+	{
+		for(int i = 0; i < CONV_SLICES; i++)
+			if(c->inv[i]) { ID3D11VideoProcessorInputView_Release(c->inv[i]); c->inv[i] = NULL; }
+		c->in_tex = tex;
+	}
+	if(!c->inv[slice])
+	{
+		D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv = {0};
+		iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+		iv.Texture2D.ArraySlice = slice;
+		HRESULT hr = ID3D11VideoDevice_CreateVideoProcessorInputView(c->vdev, (ID3D11Resource *)tex, c->venum, &iv, &c->inv[slice]);
+		if(FAILED(hr))
+		{
+			c->hw->unlock(c->hw->lock_ctx);
+			CHIAKI_LOGE(log, "shim: input view failed (hr 0x%08lx)", (unsigned long)hr);
+			return NULL;
+		}
+	}
+	int i = c->next;
+	c->next = (c->next + 1) % PS5_D3D11_RING;
+	D3D11_VIDEO_PROCESSOR_STREAM st = {0};
+	st.Enable = TRUE;
+	st.pInputSurface = c->inv[slice];
+	HRESULT hr = ID3D11VideoContext_VideoProcessorBlt(c->vctx, c->vp, c->outv[i], 0, 1, &st);
+	ID3D11DeviceContext_Flush(c->hw->device_context); // start the GPU work now
+	c->hw->unlock(c->hw->lock_ctx);
+	if(FAILED(hr))
+	{
+		CHIAKI_LOGE(log, "shim: VideoProcessorBlt failed (hr 0x%08lx)", (unsigned long)hr);
+		return NULL;
+	}
+	return c->out[i];
+}
+#endif
+
 static void frame_available_cb(ChiakiFfmpegDecoder *dec, void *user)
 {
 	Ps5Session *s = user;
@@ -53,6 +204,36 @@ static void frame_available_cb(ChiakiFfmpegDecoder *dec, void *user)
 	uint64_t t0 = chiaki_time_now_monotonic_us();
 	AVFrame *src = f.frame;
 	uint32_t transfer_us = 0;
+#ifdef _WIN32
+	if(s->zero_copy && src->format == AV_PIX_FMT_D3D11 && src->hw_frames_ctx)
+	{
+		if(s->conv && (s->conv->w != src->width || s->conv->h != src->height))
+		{
+			conv_free(s->conv);
+			s->conv = NULL;
+		}
+		if(!s->conv && !(s->conv = conv_new(&s->log, src)))
+			s->zero_copy = 0; // fall back to the copy below for the rest of the session
+		ID3D11Texture2D *rgba = s->conv ? conv_run(&s->log, s->conv, src) : NULL;
+		if(rgba)
+		{
+			Ps5Frame out = {0};
+			out.width = src->width;
+			out.height = src->height;
+			out.format = PS5_PIX_D3D11_RGBA;
+			out.data[0] = (const uint8_t *)rgba;
+			out.data[1] = (const uint8_t *)s->conv->hw->device;
+			out.frames_lost = lost;
+			out.recovered = f.recovered;
+			out.decoded_us = t0;
+			out.transfer_us = (uint32_t)(chiaki_time_now_monotonic_us() - t0);
+			if(s->frame)
+				s->frame(&out, s->user);
+			av_frame_free(&f.frame);
+			return;
+		}
+	}
+#endif
 	if(src->hw_frames_ctx)
 	{
 		if(!s->sw_frame)
@@ -216,6 +397,7 @@ PS5SHIM_API Ps5Session *ps5_session_create(const Ps5ConnectInfo *info,
 	ci.enable_dualsense = false;
 	ci.packet_loss_max = info->packet_loss_max > 0 ? info->packet_loss_max : 0.05;
 	ci.enable_idr_on_fec_failure = true;
+	s->zero_copy = info->zero_copy != 0;
 
 	ChiakiErrorCode err = chiaki_ffmpeg_decoder_init(&s->decoder, &s->log, ci.video_profile.codec,
 			info->fps, info->hw_decoder, NULL, frame_available_cb, s);
@@ -283,6 +465,9 @@ PS5SHIM_API void ps5_session_destroy(Ps5Session *s)
 		chiaki_opus_decoder_fini(&s->opus);
 	if(s->decoder_inited)
 		chiaki_ffmpeg_decoder_fini(&s->decoder);
+#ifdef _WIN32
+	conv_free(s->conv);
+#endif
 	av_frame_free(&s->sw_frame);
 	free(s);
 }

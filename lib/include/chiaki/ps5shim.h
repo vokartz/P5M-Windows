@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#define PS5SHIM_VERSION 1
+#define PS5SHIM_VERSION 2
 
 typedef struct Ps5Session Ps5Session;
 
@@ -40,6 +40,7 @@ typedef struct {
 	double packet_loss_max;
 	int32_t port_guessing;       /* PSN option, 0/1 */
 	int32_t log_level_mask;      /* chiaki log mask, 0 = default (INFO|WARN|ERR) */
+	int32_t zero_copy;           /* with d3d11va: convert on the GPU to an RGBA texture (PS5_PIX_D3D11_RGBA), no copy to RAM */
 } Ps5ConnectInfo;
 
 /* ---- events ---- */
@@ -55,7 +56,10 @@ enum {
 typedef void (*Ps5EventCb)(int32_t type, int32_t a, int32_t b, const char *msg, void *user);
 
 /* ---- video ---- */
-enum { PS5_PIX_YUV420P = 0, PS5_PIX_NV12 = 1 };
+/* PS5_PIX_D3D11_RGBA: data[0] = ID3D11Texture2D* (RGBA8, full range, owned by the session,
+ * one of PS5_D3D11_RING), data[1] = its ID3D11Device*. Register it with WGL_NV_DX_interop2. */
+enum { PS5_PIX_YUV420P = 0, PS5_PIX_NV12 = 1, PS5_PIX_D3D11_RGBA = 2 };
+#define PS5_D3D11_RING 4
 typedef struct {
 	int32_t width, height, format;
 	const uint8_t *data[3];
@@ -63,7 +67,7 @@ typedef struct {
 	int32_t frames_lost;     /* since previous frame */
 	int32_t recovered;
 	uint64_t decoded_us;     /* monotonic time the decoder returned the frame */
-	uint32_t transfer_us;    /* GPU->RAM copy time for hw frames, 0 for sw */
+	uint32_t transfer_us;    /* GPU->RAM copy (or GPU convert submit for D3D11_RGBA) time, 0 for sw */
 } Ps5Frame;
 /* Called on the decoder thread. Planes are valid only during the call: copy/upload them. */
 typedef void (*Ps5FrameCb)(const Ps5Frame *frame, void *user);
