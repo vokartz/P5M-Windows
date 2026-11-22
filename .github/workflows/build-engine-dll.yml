@@ -54,6 +54,13 @@ jobs:
           Expand-Archive -LiteralPath "ffmpeg.zip" -DestinationPath "."
           Rename-Item "ffmpeg-n7.1-latest-win64-gpl-shared-7.1" "${{ env.dep_folder }}"
 
+      - name: Setup protoc
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip" -OutFile ".\protoc.zip"
+          Expand-Archive -LiteralPath "protoc.zip" -DestinationPath ".\protoc"
+          .\protoc\bin\protoc.exe --version
+
       - name: Make build directory
         run: mkdir build
 
@@ -101,6 +108,7 @@ jobs:
           -DCHIAKI_ENABLE_SPEEX=OFF `
           -DCHIAKI_ENABLE_FFMPEG_DECODER=ON `
           -DCHIAKI_BUILD_ENGINE_DLL=ON `
+          -DPROTOC="${{ github.workspace }}\protoc\bin\protoc.exe" `
           -DPYTHON_EXECUTABLE="$((Get-Command python).Source)" `
           -DCMAKE_PREFIX_PATH="${{ github.workspace }}\${{ env.dep_folder }}"
 
