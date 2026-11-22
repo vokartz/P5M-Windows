@@ -179,6 +179,11 @@ static ID3D11Texture2D *conv_run(ChiakiLog *log, D3dConv *c, AVFrame *f)
 	}
 	int i = c->next;
 	c->next = (c->next + 1) % PS5_D3D11_RING;
+	// The decoder texture is taller than the picture (alignment rows): use only the picture.
+	RECT r = { 0, 0, c->w, c->h };
+	ID3D11VideoContext_VideoProcessorSetStreamSourceRect(c->vctx, c->vp, 0, TRUE, &r);
+	ID3D11VideoContext_VideoProcessorSetStreamDestRect(c->vctx, c->vp, 0, TRUE, &r);
+	ID3D11VideoContext_VideoProcessorSetOutputTargetRect(c->vctx, c->vp, TRUE, &r);
 	D3D11_VIDEO_PROCESSOR_STREAM st = {0};
 	st.Enable = TRUE;
 	st.pInputSurface = c->inv[slice];
