@@ -1,0 +1,12 @@
+{
+  "name": "chiaki-engine-dll",
+  "version": "1.0.0",
+  "dependencies": [
+    "pkgconf",
+    "openssl",
+    "json-c",
+    "libevent",
+    "miniupnpc",
+    "opus"
+  ]
+}

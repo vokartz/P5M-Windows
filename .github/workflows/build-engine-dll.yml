@@ -1,0 +1,126 @@
+name: Build engine DLL (ps5-rs)
+
+# Only the C engine (lib/) plus lib/src/shim.c as chiaki.dll; no Qt, no GUI.
+on:
+  workflow_dispatch:
+  push:
+    branches: [engine-dll]
+
+jobs:
+  engine-dll:
+    runs-on: windows-latest
+    env:
+      CC: clang-cl.exe
+      CXX: clang-cl.exe
+      triplet: x64-windows
+      vcpkg_baseline: c76c06644034521fb761a39f8f52d8e87d1103d5
+      dep_folder: deps
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      VCPKG_KEEP_ENV_VARS: CMAKE_POLICY_VERSION_MINIMUM
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-binary-cache,readwrite
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Set vcpkg installed dir
+        run: echo "VCPKG_INSTALLED_DIR=${{ github.workspace }}\build\vcpkg_installed" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set up Ninja
+        run: choco install ninja
+
+      - name: Set up Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: 18
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pip dependencies (nanopb generator)
+        run: python -m pip install --upgrade protobuf grpcio-tools
+
+      - name: Setup ffmpeg
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/streetpea/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip" -OutFile ".\ffmpeg.zip"
+          Expand-Archive -LiteralPath "ffmpeg.zip" -DestinationPath "."
+          Rename-Item "ffmpeg-n7.1-latest-win64-gpl-shared-7.1" "${{ env.dep_folder }}"
+
+      - name: Make build directory
+        run: mkdir build
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg-binary-cache
+          key: vcpkg-engine-${{ env.vcpkg_baseline }}-${{ hashFiles('engine-dll/vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: vcpkg-engine-${{ env.vcpkg_baseline }}-${{ hashFiles('engine-dll/vcpkg.json') }}-
+
+      - name: Make vcpkg binary cache directory
+        run: New-Item -ItemType Directory -Force -Path vcpkg-binary-cache | Out-Null
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.vcpkg_baseline }}
+          runVcpkgInstall: true
+          vcpkgJsonGlob: "engine-dll/vcpkg.json"
+
+      - name: Save vcpkg binary cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg-binary-cache
+          key: vcpkg-engine-${{ env.vcpkg_baseline }}-${{ hashFiles('engine-dll/vcpkg.json') }}-${{ github.run_id }}
+
+      - name: Apply Patches
+        run: git apply --ignore-whitespace --verbose --directory=third-party/gf-complete/ scripts/windows-vc/gf-complete.patch
+
+      - name: Configure
+        run: |
+          cmake `
+          -S . -B build -G Ninja `
+          -DCMAKE_TOOLCHAIN_FILE:STRING="vcpkg/scripts/buildsystems/vcpkg.cmake" `
+          -DVCPKG_MANIFEST_DIR="${{ github.workspace }}\engine-dll" `
+          -DCMAKE_BUILD_TYPE=Release `
+          -DCHIAKI_ENABLE_GUI=OFF `
+          -DCHIAKI_ENABLE_CLI=OFF `
+          -DCHIAKI_ENABLE_TESTS=OFF `
+          -DCHIAKI_ENABLE_SETSU=OFF `
+          -DCHIAKI_ENABLE_STEAMDECK_NATIVE=OFF `
+          -DCHIAKI_ENABLE_STEAM_SHORTCUT=OFF `
+          -DCHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER=OFF `
+          -DCHIAKI_ENABLE_SPEEX=OFF `
+          -DCHIAKI_ENABLE_FFMPEG_DECODER=ON `
+          -DCHIAKI_BUILD_ENGINE_DLL=ON `
+          -DPYTHON_EXECUTABLE="$((Get-Command python).Source)" `
+          -DCMAKE_PREFIX_PATH="${{ github.workspace }}\${{ env.dep_folder }}"
+
+      - name: Build
+        run: cmake --build build --config Release --target chiaki-engine
+
+      - name: Package
+        run: |
+          $out = "engine-out"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Get-ChildItem build -Recurse -Include chiaki.dll,chiaki.pdb,chiaki-engine.lib | Copy-Item -Destination $out
+          Copy-Item lib\include\chiaki\ps5shim.h $out
+          Copy-Item "${env:VCPKG_INSTALLED_DIR}\${{ env.triplet }}\bin\*.dll" $out
+          foreach($n in 'avcodec','avutil','swresample','swscale') { Copy-Item "${{ env.dep_folder }}\bin\$n-*.dll" $out }
+          dumpbin /nologo /exports "$out\chiaki.dll" | Select-String "ps5_"
+          dumpbin /nologo /dependents "$out\chiaki.dll"
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: chiaki-engine-dll
+          path: engine-out

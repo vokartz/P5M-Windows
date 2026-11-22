@@ -225,3 +225,14 @@ if(CHIAKI_ENABLE_TESTS)
 	add_executable(holepunch-test include/chiaki/remote/holepunch.h src/remote/holepunch-test.c)
 	target_link_libraries(holepunch-test chiaki-lib)
 endif()
+
+# ps5-rs: the engine as a DLL with a flat C interface (lib/src/shim.c).
+# Only the ps5_* functions are exported; chiaki-lib is linked in statically.
+option(CHIAKI_BUILD_ENGINE_DLL "Build chiaki.dll (ps5shim interface) for ps5-rs" OFF)
+if(CHIAKI_BUILD_ENGINE_DLL)
+	add_library(chiaki-engine SHARED src/shim.c include/chiaki/ps5shim.h)
+	target_compile_definitions(chiaki-engine PRIVATE PS5SHIM_BUILD)
+	target_link_libraries(chiaki-engine PRIVATE chiaki-lib)
+	# DLL is chiaki.dll; its import lib gets another name so it does not overwrite the static chiaki.lib
+	set_target_properties(chiaki-engine PROPERTIES OUTPUT_NAME chiaki ARCHIVE_OUTPUT_NAME chiaki-engine)
+endif()
